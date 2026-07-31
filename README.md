@@ -421,12 +421,44 @@ uv pip install -e ~/src/nnUNet
 
 On a machine with more than one disk, decide this *before* exporting the variables. Moving 200GB of preprocessed data later because you guessed wrong is a wasted afternoon.
 
+**Step 0 — count the physical drives.**
+
+Establish how many drives exist before comparing them. Bare `lsblk` buries the answer: on any box with snaps installed, thirty-plus `loop` devices for `/snap/...` mounts scroll past before real hardware appears.
+
+```bash
+lsblk -d -o NAME,SIZE,TYPE,TRAN,ROTA,MODEL,SERIAL -e7
+lsblk -d -n -o NAME -e7 | wc -l          # just the count
+```
+
+`-d` shows disks only and suppresses their partitions, so one line is one physical drive. `-e7` excludes major number 7 — the loop devices — which is what makes the output readable at all.
+
+```
+NAME      SIZE TYPE TRAN   ROTA MODEL               SERIAL
+sda     931.5G disk usb       0 Portable SSD        XXXXXXXXXXXXXXX
+nvme0n1   1.8T disk nvme      0 NVMe SSD 2TB        XXXXXXXXXXXXXXX
+```
+
+Include `SERIAL`. It distinguishes two otherwise identical drives, and it is the only identifier that survives a rename — `sda` and `sdb` can swap across a reboot depending on enumeration order, which is why the fstab entry under *Mount the second disk somewhere stable* mounts by UUID and not by device path.
+
+Three things this will not show you. Under LVM or mdadm, several physical drives present as a single logical volume — drop `-d` to see the tree, then confirm with `sudo pvs` or `cat /proc/mdstat`. A brand-new unformatted drive appears with an empty `FSTYPE` and no partition children, which is exactly what a good training-data candidate looks like. And an empty SD-card or media reader can appear as a zero-size device; ignore anything reporting `0B`.
+
+If a drive is physically present but missing from that list, `ls /sys/block/` is the kernel's unformatted view, and `sudo lshw -class disk -short` reports each drive alongside the controller behind it, which catches one that enumerated but failed to come up cleanly.
+
+**Is there room for another drive?** If the rest of this section concludes that no existing disk is suitable, the next question is whether one can be added rather than which to compromise on:
+
+```bash
+sudo dmidecode -t slot          # PCIe and M.2 slots, each marked in use or available
+sudo lshw -class storage        # the controllers behind them
+```
+
 **Step 1 — inventory the disks.**
 
 ```bash
 lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,ROTA,TRAN,MODEL
 df -hT -x tmpfs -x devtmpfs -x squashfs
 ```
+
+`MOUNTPOINTS` (plural) requires util-linux 2.37 or newer. On Ubuntu 20.04 and older the column is the singular `MOUNTPOINT`, and passing the plural form makes the whole command fail rather than degrade.
 
 Four columns answer "which is which":
 
