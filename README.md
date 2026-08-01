@@ -2,6 +2,8 @@
 
 ## Step 1 — System packages
 
+### 1a. Base packages
+
 ```bash
 sudo apt update && sudo apt upgrade -y
 sudo apt install -y build-essential git git-lfs curl wget unzip ca-certificates \
@@ -14,6 +16,95 @@ git lfs install
 Note there is no `python3-pip` or `python3-venv` in that list. `uv` manages interpreters and environments itself (Step 4), so the system Python stays untouched — which is the point.
 
 - [ ] `git --version` and `git lfs version` both report
+
+### 1b. Operational tooling
+
+None of these is required to train a model. Each answers a question you will ask within the first week of trying:
+
+```bash
+sudo apt install -y tmux htop ncdu iotop tree jq ripgrep smartmontools nvme-cli
+```
+
+| Tool | The question it answers |
+|---|---|
+| `tmux` | "My SSH dropped — did that kill the training run?" (see 1c) |
+| `htop` | What is using CPU and RAM right now |
+| `ncdu` | Which directory filled the disk — far faster than `du` on an imaging tree |
+| `iotop` | Whether the GPU is idle because the data loader is I/O-starved |
+| `nvme-cli` | `nvme list` — drive identity, namespaces, wear (Step 9) |
+| `smartmontools` | `smartctl -i` — is a candidate drive healthy before you trust data to it |
+| `jq` | Reading DVC and MLflow JSON without opening a Python session |
+
+For the GPU, `nvidia-smi` ships with the driver but prints snapshots. `nvtop` gives an htop-style live view of utilization and per-process VRAM, which is what distinguishes a compute-bound epoch from a loader-starved one:
+
+```bash
+sudo apt install -y nvtop
+```
+
+### 1c. tmux — do this before anything long-running
+
+**Set this up before the first training run, not after losing one.** An SSH session is the parent process of everything launched inside it. When the connection drops — laptop sleeps, VPN reconnects, Wi-Fi hiccups — the shell gets `SIGHUP` and takes your job down with it. A multi-hour preprocessing run dies at hour three and leaves a half-written dataset that looks complete. This is the most common way remote ML work is lost and it is entirely preventable.
+
+tmux keeps the session alive **on the server**, independent of your connection:
+
+```bash
+tmux new -s train          # start a named session
+# ... launch the long job ...
+# detach: Ctrl-b then d     — the job keeps running
+
+tmux ls                    # list sessions
+tmux attach -t train       # reattach from anywhere, after any disconnect
+```
+
+Detaching is not backgrounding. The process keeps its terminal, so progress bars, prompts, and training output are all still there when you return.
+
+A minimal config, because two defaults will bite you:
+
+```bash
+cat > ~/.tmux.conf <<'EOF'
+set -g mouse on                    # scroll, and click between panes
+set -g history-limit 100000        # default 2000 silently eats your training log
+setw -g mode-keys vi
+bind | split-window -h
+bind - split-window -v
+EOF
+tmux kill-server                   # config is read when the server starts
+```
+
+`history-limit` is the one that matters. The default 2000 lines discards the *beginning* of a long training log, which is exactly where the config dump and first-epoch losses live.
+
+Enough keys to be useful: `Ctrl-b |` and `Ctrl-b -` split panes with the config above, `Ctrl-b` plus an arrow key moves between them, `Ctrl-b c` opens a window and `Ctrl-b n`/`p` cycles. A workable layout is one pane training, one running `nvtop`, one free.
+
+**tmux is not a substitute for a service.** It survives a dropped connection, not a reboot — for that use a systemd user unit (the MLflow example in 11c). One further trap: a long-lived tmux session does not pick up environment variables added to `~/.bashrc` after it started, which is a recurring source of `KeyError: 'nnUNet_raw'` in a session that has been attached for a week.
+
+- [ ] `tmux new -s test`, detach with `Ctrl-b d`, then `tmux attach -t test` returns you to it
+
+### 1d. cmux — parallel coding agents
+
+Disambiguate before installing: at least four unrelated projects use this name, and only some run on Linux.
+
+| Project | What it is | Runs on |
+|---|---|---|
+| [manaflow-ai/cmux](https://github.com/manaflow-ai/cmux) | Native Swift/AppKit terminal — vertical tabs, split panes, embedded browser, built for watching several coding agents at once | **macOS only** |
+| [craigsc/cmux](https://github.com/craigsc/cmux) | Pure-bash wrapper giving each agent its own git worktree | macOS and Linux |
+| [soheilhy/cmux](https://github.com/soheilhy/cmux) | Go library for multiplexing protocols on one port — nothing to do with terminals | n/a (library) |
+
+If you drive this Linux box from a Mac, the macOS app belongs **on the Mac**. It is a terminal emulator: it replaces the thing you type into, so it has no server-side component and nothing about it belongs in this runbook except the warning not to look for it here.
+
+```bash
+# on the Mac — NOT on the Linux box
+brew tap manaflow-ai/cmux
+brew install --cask cmux
+```
+
+What does install on the Linux box is the worktree manager, which needs only bash, git, and the Claude CLI:
+
+```bash
+curl -fsSL https://github.com/craigsc/cmux/releases/latest/download/install.sh | sh
+echo '.worktrees/' >> .gitignore      # in each repo you use it in
+```
+
+Despite the "tmux for Claude Code" tagline it neither uses nor requires tmux — the isolation is a git worktree per agent, not a pane per agent. The two compose rather than compete: tmux keeps sessions alive across a dropped SSH connection, cmux keeps parallel agents from editing the same working tree. Read that install script before piping it to a shell, as with any `curl | sh`.
 
 ---
 
@@ -94,7 +185,7 @@ Host github.com
 EOF
 ```
 
-## uv
+## Step 4 — uv
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -372,6 +463,71 @@ dvc repro                     # re-run dvc.yaml stages whose deps changed
 
 The failure that costs the most time is committing a pointer without pushing the bytes: collaborators get `No file hash info found` on pull. Make `dvc push` reflexively follow `git push`. Setting `autostage = true` in `.dvc/config` stages the `.dvc` file for you and removes one step.
 
+### 7h. Bringing a new dataset under DVC
+
+7a–7g assume the repo already tracks data. This is the other direction: you have a directory of images and want it versioned.
+
+**Put the cache on the right disk first.** DVC's cache defaults to `.dvc/cache` inside the repo, which lands every byte on whatever disk holds `$HOME` — typically the OS drive, and typically the one with the least room. Set it before the first `dvc add`, because moving it afterwards means re-hashing everything:
+
+```bash
+cd <repo>
+dvc init                                     # requires an existing git repo
+dvc cache dir /data/dvc-cache                # the large disk chosen in Step 9
+dvc config cache.type reflink,hardlink,symlink
+git add .dvc/config && git commit -m "dvc: cache on the data disk"
+```
+
+`cache.type` is what stops each dataset from occupying twice the space. By default DVC **copies** files out of the cache into the working tree, so a 200GB cohort costs 400GB. Reflink is best — instant and copy-on-write, but needs XFS or Btrfs; hardlink is the usual ext4 fallback; DVC walks the list until one works. This is where the Step 9 filesystem test pays off: on exFAT or NTFS none of them work and you are silently back to full copies.
+
+The tradeoff is real. Hardlinked and symlinked working files share storage with the cache, so editing one in place corrupts the cached copy — DVC guards against this by making them read-only. When you genuinely need to modify a tracked file, run `dvc unprotect <path>` first to turn it back into a private copy.
+
+**Then add the data.** The granularity choice matters more than it appears:
+
+```bash
+dvc add data/raw/                 # one pointer for the whole directory
+dvc add data/raw/case001.nii.gz   # one pointer per file
+```
+
+A directory gives one `.dvc` file and an all-or-nothing `dvc pull`. Per-file pointers let a collaborator fetch one case without the other 900, at the cost of 900 `.dvc` files in git. For imaging cohorts the directory form is nearly always right, with the split made at the *cohort* level — `data/train/`, `data/holdout/` — so a V&V holdout can be withheld from a machine that should not see it. That split is easy now and painful to retrofit.
+
+```bash
+git add data/raw.dvc data/.gitignore
+git commit -m "track raw cohort"
+dvc push
+```
+
+DVC writes the `.gitignore` entry itself so git never sees the bytes. Commit both files, or a collaborator gets a pointer with nothing behind it.
+
+**Exclude what should never be hashed** via `.dvcignore`, which takes `.gitignore` syntax and saves DVC from walking scratch output on every status check:
+
+```
+*.tmp
+**/__pycache__/
+**/.ipynb_checkpoints/
+```
+
+**Make derived data a stage, not a tracked artifact.** Anything you can regenerate should be reproducible rather than merely stored — this is what makes a retraining defensible later:
+
+```bash
+dvc stage add -n preprocess \
+  -d scripts/preprocess.py -d data/raw \
+  -o data/preprocessed \
+  python scripts/preprocess.py data/raw data/preprocessed
+
+git add dvc.yaml dvc.lock && git commit -m "add preprocess stage"
+dvc repro
+```
+
+`dvc.lock` records the exact input hashes that produced the output, so `dvc repro` re-runs a stage only when a dependency really changed, and the committed lock file is the evidence of which raw data produced which derived set.
+
+**Before any of this touches real patient data**, the Step 6c questions apply — bucket agreement, de-identification status, disk encryption. `dvc push` is an upload: it moves bytes off this machine to whichever remote is default. Confirm `dvc remote list` names the remote you think it does before the first push of anything sensitive.
+
+```bash
+dvc status              # workspace vs cache
+dvc status -c           # cache vs remote — exactly what a push would send
+du -sh data/raw         # bytes, not pointers
+```
+
 ---
 
 ## Step 8 — PyTorch
@@ -617,6 +773,38 @@ uv tool install mlflow==3.14.0         # optional: standalone `mlflow server` CL
 
 MLflow 3.14 requires Python ≥3.10, the same floor as nnU-Net. If a machine only *logs* runs and never serves the UI, `mlflow-skinny` is a much smaller install with the same logging API.
 
+### 11b. Logging a run
+
+The client half is three lines: point at a tracking server, name an experiment so runs do not all pile into `Default`, and wrap the training loop.
+
+```python
+import mlflow
+
+mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_experiment("spine-seg-lumbar")
+
+with mlflow.start_run(run_name="nnunet-3d-fullres-fold0"):
+    mlflow.log_params({"fold": 0, "lr": 1e-2, "patch": "128x128x128"})
+    for epoch in range(n_epochs):
+        mlflow.log_metric("dice_val", dice, step=epoch)
+    mlflow.log_artifact("plots/dice_curve.png")
+```
+
+The `step` argument is the difference between a curve and a single final number. Omitting it is the most common reason an MLflow chart shows one dot.
+
+`mlflow.autolog()` captures params, metrics and the model automatically and is a fair default for scikit-learn or Lightning. It does much less for nnU-Net, which owns its training loop and writes its own logs — there you log explicitly, and the honest integration point is a callback or a post-hoc parse of nnU-Net's `training_log*.txt`.
+
+Log what lets you reconstruct the run a year later: the git commit, the **data version**, and the environment. The data version is the one people omit, and it is the one that separates a reproducible experiment from a merely recorded one:
+
+```python
+mlflow.log_params({
+    "git_sha": subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip(),
+})
+mlflow.log_artifact("data/raw.dvc")     # the DVC pointer names the exact cohort
+```
+
+Logging the `.dvc` pointer rather than a path is deliberate: a path tells you where the data was, the pointer's hash tells you *which* data it was, and only the second survives someone overwriting the directory.
+
 ### 11c. Local server
 
 Prefer one shared server across related projects over a database per repo — runs stay comparable and the registry has a single home.
@@ -676,6 +864,30 @@ mlflow server \
 
 **`--host 0.0.0.0` publishes an unauthenticated server.** Default MLflow has no auth: anyone who can reach the port can read every run and delete experiments. In order of preference: keep it on `127.0.0.1` and reach remote instances over an SSH tunnel (`ssh -L 5000:127.0.0.1:5000 <host>`); enable built-in basic auth with `--app-name basic-auth`; or put it behind a reverse proxy that handles authentication.
 
+### 11f. Reaching the UI from a laptop
+
+The 11c server binds `127.0.0.1`, so nothing off the box can reach it — the correct default. To view the UI from a laptop, forward the port over SSH rather than rebinding the server to `0.0.0.0`:
+
+```bash
+# from the laptop
+ssh -N -L 5000:127.0.0.1:5000 <user>@<box>
+```
+
+Then open `http://127.0.0.1:5000` in the laptop's browser. `-N` means "no remote command", so you get the tunnel and nothing else; add `-f` to push it into the background. Nothing is exposed to the network and no authentication has to be configured, because the traffic rides an SSH session you already trust.
+
+If port 5000 is taken locally, remap the left side only: `-L 5001:127.0.0.1:5000`, then browse to 5001. The right-hand side is the address *on the box* and stays `127.0.0.1:5000` regardless — reversing those two is the usual reason a tunnel connects but the page never loads.
+
+To stop rebuilding it by hand, put it in the laptop's `~/.ssh/config` so it comes up with every connection to that host:
+
+```
+Host mlbox
+    HostName <ip-or-hostname>
+    User <user>
+    LocalForward 5000 127.0.0.1:5000
+```
+
+Then `ssh mlbox` both logs you in and forwards the UI. The same pattern reaches any other loopback-bound service on the box — add a `LocalForward` line per port.
+
 ---
 
 ## Step 12 — End-to-end verification
@@ -685,8 +897,11 @@ ssh -T git@bitbucket.org
 ssh -T git@github.com                 # exit status 1 on success is normal — read the message
 aws sts get-caller-identity
 dvc --version && dvc remote list
+dvc cache dir                         # should be the data disk, not $HOME
 python -c "import torch, nnunetv2, totalsegmentator, mlflow; print('torch', torch.__version__, '| cuda', torch.cuda.is_available())"
 echo "$nnUNet_raw $nnUNet_preprocessed $nnUNet_results"
 curl -sf "$MLFLOW_TRACKING_URI/health" && echo " mlflow ok"
+tmux -V && tmux ls 2>/dev/null || echo "tmux installed, no sessions yet"
+lsblk -d -o NAME,SIZE,TRAN,MODEL -e7   # the drives you decided on in Step 9
 nvidia-smi
 ```
