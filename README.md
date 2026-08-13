@@ -530,6 +530,95 @@ du -sh data/raw         # bytes, not pointers
 
 ---
 
+## Data transfer — getting source data onto the box
+
+7h assumes the bytes already sit on a local disk. Usually they don't: the cohort arrives on a cloud drive (Box, Drive, SharePoint) that only a laptop is signed into, and the workstation is headless or on a different network. Two routes work, and the choice is not cosmetic — one of them moves every byte twice.
+
+**Check the size and the destination free space first.** A pull that fills the OS disk takes the desktop session down with it, and `df` on `$HOME` is not the number that matters if the data disk from Step 9 is the target:
+
+```bash
+df -h /data                     # the destination disk, not $HOME
+rclone size box:path/to/folder  # or du -sh on a mounted copy
+```
+
+### Route A — rclone straight from the cloud to the box (preferred)
+
+Box is a native rclone backend, so the workstation pulls directly and the laptop never touches the data. This is the right choice for anything large: parallel transfers instead of a serial stream, one hop instead of two, and nothing staged on a laptop disk.
+
+If the box has a desktop session, let rclone open its own browser:
+
+```bash
+rclone config
+# n) new remote  →  name: box  →  storage: box
+# box_config_file: (blank), box_sub_type: user
+# "Use web browser to automatically authenticate?" → y
+```
+
+If it's headless, run the browser half on any machine that has one — including the Mac — and paste the result back:
+
+```bash
+rclone authorize "box"          # on the laptop; prints a JSON token
+rclone config                   # on the box; answer n to the browser question, paste the token
+```
+
+Either way the credential lands in `~/.config/rclone/rclone.conf`. Then:
+
+```bash
+rclone lsd box:                                    # sanity check before committing to a pull
+rclone copy box:"path/to/folder" /data/dest \
+  --transfers 8 --checkers 16 --progress --log-file=/tmp/box-pull.log
+```
+
+Use `copy`, never `sync` — `sync` makes the destination match the source, which means deleting local files that aren't on the remote. Re-running `copy` skips what already arrived, so an interrupted pull resumes by re-running the same command. Above roughly 8 transfers Box starts rate-limiting and throughput gets worse, not better.
+
+Two things to know before relying on this. Ubuntu 24.04 packages rclone **v1.60.1** (Nov 2022) and the Box backend has had fixes since; if auth or listing misbehaves, install current rclone alongside it rather than debugging the old one:
+
+```bash
+curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
+unzip rclone-current-linux-amd64.zip
+sudo install -m 755 rclone-v*/rclone /usr/local/bin/rclone
+hash -r && rclone version       # /usr/local/bin precedes /usr/bin on PATH
+```
+
+And an enterprise Box tenant can block third-party OAuth clients, in which case `rclone lsd box:` fails at consent with an admin-approval error. That is not fixable from this side — it needs either an allowlist entry for rclone's client ID or the official Box CLI (`npm i -g @box/cli`) backed by a JWT app the Box admin authorizes. Fall back to Route B if neither is quick.
+
+### Route B — rsync from a laptop's cloud mount
+
+rsync speaks SSH, and Box exposes no SSH or rsync endpoint, so there is nothing to point it at directly. What makes rsync work is the desktop sync client: Box Drive presents the account as an ordinary directory, and rsync pushes from there over SSH like any other local path.
+
+```bash
+ls ~/Library/CloudStorage/                     # confirm the mount name first
+BOX=~/Library/CloudStorage/Box-Box             # older Box Drive used ~/Box instead
+
+tmux new -s boxpull                            # survives a closed lid
+rsync -avh --partial --progress \
+  "$BOX/Some Folder/" user@<box-ip>:/data/dest/
+```
+
+A trailing slash on the source copies the *contents*; no trailing slash copies the folder itself. `--partial` keeps a half-transferred file so an interrupted run resumes instead of restarting it.
+
+The cost is hydration. Box Drive files are on-demand placeholders, so rsync pulls each one down to the laptop's disk as it reads it: the transfer runs at Box's download speed rather than LAN speed, and needs free space on the laptop. Marking the folder "Available Offline" in Finder first and letting it settle converts the rsync into a genuine LAN copy.
+
+**Apple's rsync is a trap.** macOS 14 and earlier ship rsync **2.6.9** — from 2006, missing `--info=progress2` and much else; macOS 15 replaced it with **openrsync**, a BSD reimplementation with different gaps and different error text. Check before scripting anything against it, and prefer a real one:
+
+```bash
+rsync --version | head -1
+brew install rsync              # rsync 3.4.x at /opt/homebrew/bin/rsync
+```
+
+### Verify, then hand off to DVC
+
+A transfer that silently truncated is worse than one that failed. Confirm before the source goes away:
+
+```bash
+rclone check box:"path/to/folder" /data/dest --one-way   # hashes both sides
+rsync -avhn --delete "$BOX/Some Folder/" user@<box>:/data/dest/   # -n: dry run, lists differences only
+```
+
+Then the data is a local directory like any other, and 7h applies: put the DVC cache on the data disk, `dvc add` at cohort granularity, and confirm `dvc remote list` before the first push if any of it is patient data.
+
+---
+
 ## Step 8 — PyTorch
 
 Check the driver before installing anything:
@@ -905,3 +994,110 @@ tmux -V && tmux ls 2>/dev/null || echo "tmux installed, no sessions yet"
 lsblk -d -o NAME,SIZE,TRAN,MODEL -e7   # the drives you decided on in Step 9
 nvidia-smi
 ```
+
+---
+
+## Onboarding a project — repo, data, and the first tracked run
+
+Steps 1–12 provision the box; this is the first real project on it. Clone a training repo, take a cohort already sitting on the data disk from the transfer section, put it under DVC against an S3 bucket, and get a training run into MLflow. Every component is documented above — 7d for the remote, 7h for `dvc add`, 11b for run logging. What this section adds is the order, and the two failures that only appear when the pieces are combined.
+
+### Clone the repo onto the data disk, not into `$HOME`
+
+This is the decision that quietly determines whether every dataset costs one copy or two.
+
+DVC's `cache.type reflink,hardlink,symlink` (7h) works by sharing storage between the cache and the working tree. **Reflink and hardlink cannot cross a filesystem boundary.** If the cache is on `/data` and the repo is in `$HOME` on the OS disk, DVC walks the list, finds neither can apply, and silently falls back to `copy` — so a 200GB cohort occupies 200GB of cache plus 200GB of working tree, on two different disks, with no warning. The symptom is a data disk that fills at twice the expected rate.
+
+Keeping the repo and the cache on the same filesystem removes the problem entirely:
+
+```bash
+sudo mkdir -p /data/repos && sudo chown "$USER:$USER" /data/repos
+cd /data/repos
+git clone git@github.com:<org>/<repo>.git      # SSH keys from Step 3
+cd <repo>
+```
+
+```bash
+uv venv --python 3.11 && source .venv/bin/activate     # Step 4
+uv pip install -e .                                     # or -r requirements.txt
+uv pip install 'dvc[s3]' mlflow
+```
+
+### Initialize DVC with the cache on the same disk
+
+```bash
+dvc init
+dvc cache dir /data/dvc-cache
+dvc config cache.type reflink,hardlink,symlink
+git add .dvc/config && git commit -m "dvc: cache on the data disk"
+```
+
+Confirm the constraint above actually holds, rather than assuming it:
+
+```bash
+stat -c '%d %n' /data/dvc-cache .      # same first number = same filesystem
+```
+
+Different numbers mean you are about to pay for every dataset twice. Fix it before the first `dvc add`, because changing the cache location afterwards re-hashes everything.
+
+### Move the cohort into the repo
+
+DVC tracks paths *inside* the working tree, so data parked at `/data/incoming` has to move in. On the same filesystem this is a metadata operation — instant, no bytes copied, regardless of cohort size:
+
+```bash
+stat -c '%d %n' /data/incoming .      # verify same filesystem FIRST
+mkdir -p data
+mv /data/incoming/<cohort> data/raw
+```
+
+If those device numbers differ, `mv` degrades into a full copy-then-delete and needs the cohort's size free on the destination. Check before running it on 200GB.
+
+Resist `dvc add --external` for data that lives outside the repo. It exists, it is discouraged in DVC 3.x, and it gives up the guarantee that a clone plus `dvc pull` reproduces the tree.
+
+### Point at S3 and push
+
+Bucket creation and IAM are 7b and 7c; the wiring is 7d:
+
+```bash
+dvc remote add -d storage s3://<bucket>/<repo-name>
+dvc remote modify storage profile <profile>
+dvc remote modify storage region <region>
+git add .dvc/config && git commit -m "dvc: point remote at s3"
+```
+
+```bash
+dvc add data/raw
+git add data/raw.dvc data/.gitignore && git commit -m "track raw cohort"
+dvc push
+```
+
+**Verify the sharing worked**, which is the whole point of the disk layout above. Free space should barely move across `dvc add`, because the cache entry and the working file are the same extents:
+
+```bash
+df -h /data | tail -1     # before dvc add
+dvc add data/raw
+df -h /data | tail -1     # after — a second full copy means the fallback fired
+```
+
+A drop equal to the cohort size means you are on `copy`. Re-check `stat -c %d`, and on XFS confirm `xfs_info /data | grep reflink` reports `reflink=1`.
+
+Before the first push of anything patient-derived, the 6c questions apply: `dvc remote list` names the bucket you think it does, and the de-identification status is settled. `dvc push` is an upload, and it is not undone by deleting the local copy.
+
+### First tracked run
+
+Point the client at the server from 11c and log against the cohort you just tracked:
+
+```bash
+export MLFLOW_TRACKING_URI=http://127.0.0.1:5000     # add to ~/.bashrc
+python -c "import mlflow; print(mlflow.get_tracking_uri())"
+```
+
+Follow 11b for the run body. The one line to not skip is `mlflow.log_artifact("data/raw.dvc")` — that pointer's hash is what ties the run to *this* cohort rather than to a directory path that someone can overwrite next month. Together with `git_sha`, it is what makes the run reconstructable: the commit gives you the code, the pointer gives you the data, and `dvc pull` turns the pointer back into bytes.
+
+### Order matters
+
+- [ ] repo cloned on the data disk, same filesystem as the intended cache
+- [ ] `dvc init` and `dvc cache dir` set **before** the first `dvc add`
+- [ ] cohort moved inside the repo, verified same-filesystem so `mv` stays instant
+- [ ] remote added and committed before `dvc push`
+- [ ] `df` shows no second full copy after `dvc add`
+- [ ] first run logs `git_sha` and the `.dvc` pointer, not a data path
