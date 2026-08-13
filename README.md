@@ -1100,4 +1100,373 @@ Follow 11b for the run body. The one line to not skip is `mlflow.log_artifact("d
 - [ ] cohort moved inside the repo, verified same-filesystem so `mv` stays instant
 - [ ] remote added and committed before `dvc push`
 - [ ] `df` shows no second full copy after `dvc add`
+
+---
+
+## A labelled NIfTI cohort, end to end
+
+The section above tracks a cohort as one opaque directory. This one is the version you want when the data is **already NIfTI, already de-identified, and comes with labels** — and when a second labelled batch is going to arrive later and have to be merged with the first without quietly corrupting it.
+
+It uses `ds-datakit` — an internal package that puts imaging cohorts under DVC with de-identification, chunking, and label integrity checks — for the data layer, then hands off to nnU-Net and MLflow. The three helper scripts referenced here live in `scripts/` in this repo, and every command below was exercised against a synthetic cohort before being written down.
+
+The whole sequence, before the detail:
+
+```
+register  →  label  →  QC  →  track  →  push  →  stage  →  preprocess  →  train
+   │           │        │       │        │        │           │            │
+   └ layout    └ masks  └ gate  └ dvc    └ S3     └ nnU-Net   └ plans      └ detached
+     + manifest  + map     the    chunks            layout      + splits     + MLflow
+                           merge
+```
+
+### Why not just `dvc add data/raw`
+
+Because a directory pointer is all-or-nothing, and it knows nothing about what is inside it. ds-datakit buys three things that matter once there is more than one cohort:
+
+- **Per-study chunks.** `dvc add` on the tree gives one pointer; ds-datakit gives one per study per representation, so `pull --modality CT --rep nifti` fetches images without masks, or one study without the other 900.
+- **A manifest you can query.** `ds-datakit query --has-label segmentation` answers "which studies are actually labelled" from an index rather than by walking the disk.
+- **Gates on the label step.** Geometry and labelmap checks run at attach time, so a mask that does not belong to its image is rejected in the second it is added rather than discovered after a training run.
+
+The cost is conforming to its layout. That is the next two subsections.
+
+### Install — and the NIfTI door
+
+```bash
+cd /data/repos
+git clone git@github.com:<org>/ds-datakit.git
+uv pip install -e '/data/repos/ds-datakit[dvc]'
+```
+
+The `[dicom]` extra is only needed for DICOM ingest, which this workflow skips entirely. `[dvc]` is required — `track` and `push` shell out to the `dvc` CLI.
+
+```bash
+export DS_DATAKIT_DATA_ROOT=/data/ds-data      # add to ~/.bashrc
+ds-datakit doctor                              # prints the resolved paths
+```
+
+Put the data root on the **data disk**, next to the DVC cache, for the same reflink/hardlink reason as the previous section.
+
+**`ds-datakit ingest` is DICOM-only.** It de-identifies, converts to NIfTI, and writes the manifest in one pass — and there is no NIfTI equivalent, because for DICOM the manifest is built from the tags. Data that arrives as NIfTI has no tags to read, so the manifest is the one piece you have to produce yourself. That is all `scripts/register_nifti_cohort.py` does. Everything downstream — `track`, `label add`, `push`, `pull`, `query`, `card` — then behaves exactly as documented for an ingested dataset.
+
+There is nothing to de-identify here and no crosswalk is created, so the encrypted-crosswalk half of ds-datakit stays dormant. `push`'s safety guard still runs: it looks for stray `.enc` files and scans `manifest.json` for identifiers, and finds no DICOM to verify.
+
+### The layout, and the one rule that breaks everything
+
+```
+$DS_DATAKIT_DATA_ROOT/<dataset>/
+  CT/P_<hex>/S_<hex>/nifti/<name>.nii.gz
+  CT/P_<hex>/S_<hex>/labels/segmentation/<label-set>/<mask>.nii.gz
+  CT/P_<hex>/S_<hex>/labels/segmentation/<label-set>/labelmap.json
+  manifest.json
+```
+
+**A study's directory is derived from the NIfTI path's grandparent**, not from a field. ds-datakit computes `study_reldir` as `Path(nifti_relpath).parent.parent`, so the image must sit exactly at `<MODALITY>/<patient>/<study>/nifti/<file>`. One directory too shallow and every label lands in the wrong place, `track` chunks the wrong directories, and nothing raises. The registration script enforces it; if you build the tree by hand, this is the rule to check first.
+
+Two identifier decisions get made here and are painful to change later:
+
+**Do not reuse the source case ID as the pseudonym** without looking at it. Identifiers of the form `250714.RB.02` encode a service date and a patient's initials — that is re-identifying information even though no name appears anywhere in the file, and it ends up in git via the manifest. `--id-mode hash` (the default) derives a stable opaque ID and writes the reverse map to a file **outside** the data root, which is where it belongs.
+
+**Get the patient grouping right now.** Each volume becomes its own patient unless you tell the script otherwise:
+
+```bash
+python scripts/register_nifti_cohort.py --patient-regex '^(subj[0-9]+)'   # group 1 = the patient key
+```
+
+If one subject contributed a pre-op and a post-op scan and they register as two patients, they will land on both sides of the train/validation split, and every number you report afterwards is optimistic. Retrofitting the grouping means re-registering the cohort.
+
+### Register the cohort
+
+```bash
+python scripts/register_nifti_cohort.py \
+  --images /data/incoming/cohortA/images \
+  --dataset cohortA \
+  --modality CT \
+  --patient-regex '^(subj[0-9]+)' \
+  --map-out /data/private/cohortA.idmap.json
+```
+
+```
+cohortA: +6 series (0 already registered) -> 6 series / 3 patients
+wrote /data/ds-data/cohortA/manifest.json
+wrote /data/private/cohortA.idmap.json  (source -> pseudonym; keep out of git and DVC)
+```
+
+`--link copy` is the default. `--link hardlink` costs no extra bytes on the same filesystem, at the price of a real subtlety: DVC marks tracked working files read-only to protect the cache, and a hardlink shares one inode, so **the original source file becomes read-only too**. `--link move` is right when the source is scratch space you want emptied.
+
+Re-running is safe but **skips series already in the manifest** — meaning that if you fix a bad export and re-run, the corrected file is silently ignored, because registration keys on the identifier and not the bytes. Pass `--replace` when the source has genuinely changed.
+
+- [ ] the patient count in the output matches the number of real subjects, not the number of files
+
+### Attach the labels
+
+```bash
+ds-datakit label add /data/incoming/cohortA/labels/subj01_scan1.nii.gz \
+  --dataset cohortA \
+  --study S_e816b3174687 \
+  --task segmentation \
+  --label-set gt-v1 \
+  --labelmap /data/private/labelmap.json \
+  --image CT/P_1c7942ec8062/S_e816b3174687/nifti/subj01_scan1.nii.gz
+```
+
+Four things about this command are easy to get wrong:
+
+- **`--labelmap` is mandatory for `--task segmentation`** and maps integer value to class name: `{"1": "vertebra", "2": "disc"}`. Without it the command refuses and removes what it copied. This file is the contract that lets a second cohort be merged safely — treat it as the dataset's schema, not a formality.
+- **`--image` is optional but should never be omitted.** It triggers a check that the mask's shape and affine match the image (`atol=1e-3`); on mismatch the label directory is deleted and the command errors. That is the check that catches a mask exported in a different orientation or resampled to a different grid — the failure that otherwise surfaces as a model that trains fine and segments nothing.
+- **The path is relative to the dataset base**, not to your shell. `CT/P_…/S_…/nifti/…`, exactly as it appears in `manifest.json`.
+- **`--label-set` is a version, so use it as one.** `gt-v1`, `gt-radA-v1`, `pred-nnunet-v1`. Re-labelling the same studies later goes in a new set beside the old one, which is what makes a comparison possible.
+
+Valid tasks are `segmentation`, `landmarks`, `keypoints`, `bbox`, `classification`, `measurements`, `report`.
+
+Scripting the loop over a cohort is a few lines — read `manifest.json`, match each study back to its mask through the ID map, and shell out. `label add` also appends the task to each record's `labels` list, which is what makes `pull --label segmentation` and `query --has-label` work afterwards.
+
+### Track and push — the ordering trap
+
+```bash
+ds-datakit init --remote s3://<bucket>/<prefix>      # once per data root
+ds-datakit track --dataset cohortA
+git -C "$DS_DATAKIT_DATA_ROOT" add -A
+git -C "$DS_DATAKIT_DATA_ROOT" commit -m "register cohortA (6 studies, gt-v1)"
+ds-datakit push --dataset cohortA
+```
+
+**`track` must run after `label add`, not before.** It walks the manifest and `dvc add`s each study's `nifti/` and each `labels/<task>/` directory that exists *at that moment*. Tracking first and labelling second produces a dataset whose images are versioned and whose masks are not in DVC at all — and since git only ever sees pointers, nothing looks wrong until a colleague pulls and finds no labels. Re-running `track` is idempotent and cheap; run it again after every labelling pass.
+
+```bash
+dvc status -c                    # what a push would actually send
+ds-datakit query --dataset cohortA --has-label segmentation
+```
+
+### Adding the second, newly labelled cohort
+
+Two shapes work, and the choice is about how you will want to slice the data later:
+
+**One dataset, more studies** — register the new batch into the *same* `--dataset`. The manifest grows, `track` picks up the new studies, and there is one thing to pull. Right when the new data is more of the same.
+
+**A second dataset, combined at staging** — register as `cohortB` and merge only when building the training set. Right when the batches differ in a way you may later want to hold constant: a different labeller, a different scanner, a different site. You keep the ability to train on A, on B, or on both, and to report which. This is the default recommendation, and it is what the staging script expects.
+
+Either way, the merge is where the silent failures live. All of these are checked by `scripts/qc_cohort.py`:
+
+- **Labelmap drift.** If cohort B calls `2` *pedicle* and cohort A calls `2` *disc*, merging them trains one class on two anatomies. Nothing errors; Dice just comes out mediocre and inexplicable. The labelmaps must be byte-identical, and the staging script refuses when they are not.
+- **The same patient in both cohorts.** Two batches assembled at different times routinely overlap. Pseudonym collision catches it when the ID derivation matched; `--duplicate-scan` catches it when it did not, by hashing voxel data rather than files — the same scan re-exported differs byte-for-byte but is identical as an image.
+- **Empty masks.** An export that "succeeded" and wrote all zeros passes every structural check, trains as pure background, and drags the loss in a direction that looks like slow progress.
+- **Mixed orientation.** A handful of volumes in a different axis convention from the rest is the classic tail-end failure: the model learns the majority convention and simply fails on the minority.
+- **Classes declared but never present**, which turns into a class the network can never predict and a per-class Dice of zero that gets misread as a modelling problem.
+
+```bash
+python scripts/qc_cohort.py --dataset cohortA --dataset cohortB \
+  --label-set gt-v1 --require-labels --duplicate-scan
+```
+
+```
+studies: 10   labelled: 10   patients: 5
+class voxel counts: 1=1,000, 2=800
+PASS
+```
+
+It exits non-zero on any hard failure, so it can gate the pipeline. `--duplicate-scan` reads every voxel and is slow on a large cohort; it is also the check most worth its runtime the first time two cohorts meet.
+
+- [ ] QC exits 0 **before** anything is staged for training
+
+### Stage to nnU-Net
+
+The layouts do not match and nothing bridges them automatically:
+
+```
+ds-datakit  CT/<patient>/<study>/nifti/<name>.nii.gz
+nnU-Net     nnUNet_raw/Dataset501_Name/imagesTr/<case>_0000.nii.gz
+```
+
+The `_0000` is the channel index and is not optional; `dataset.json` must exist; and labels there map **name to value**, the inverse of a ds-datakit labelmap.
+
+```bash
+export nnUNet_raw=/data/nnunet/raw
+export nnUNet_preprocessed=/data/nnunet/preprocessed
+export nnUNet_results=/data/nnunet/results
+
+python scripts/stage_nnunet.py \
+  --dataset cohortA --dataset cohortB \
+  --id 501 --name SpineCombined \
+  --label-set gt-v1 \
+  --write-splits
+```
+
+Staging is by symlink, so the combined cohort costs no additional bytes and the DVC-tracked tree stays the only copy of record.
+
+Two things worth understanding rather than pasting:
+
+**`--channel-name` changes the model.** nnU-Net picks its intensity normalisation from that string: `CT` triggers global foreground-percentile normalisation computed across the dataset, anything else falls back to per-image z-score. For CT the global scheme is what preserves Hounsfield meaning across cases. Setting it wrong is silent and costs accuracy.
+
+**`--write-splits` is the option not to skip.** nnU-Net's default 5-fold split is random over *cases*. With one patient contributing two studies, that patient appears in train and validation simultaneously and every validation number is inflated. The flag writes a patient-disjoint `splits_final.json` instead:
+
+```
+fold 0: 8 train / 2 val | 4 vs 1 patients | leak=none
+```
+
+nnU-Net reads `splits_final.json` from `$nnUNet_preprocessed/Dataset501_.../` and only **after** preprocessing has created that directory — so write it after the plan step below, or re-run the flag once preprocessing exists. A file written too early is silently overwritten by the random default.
+
+### Preprocess
+
+```bash
+nnUNetv2_plan_and_preprocess -d 501 --verify_dataset_integrity
+```
+
+`--verify_dataset_integrity` is worth the extra minutes; it is the last cheap chance to catch a geometry problem.
+
+**Budget the disk before starting.** Preprocessed data commonly runs two to four times the raw cohort, and `nnUNet_results` accumulates checkpoints per fold. On a box where `/data` also holds the DVC cache and the working tree, that is four claims on one disk. `df -h /data` before, and again after the plan step, so the growth rate is a measurement and not a surprise at 3am.
+
+Neither `nnUNet_preprocessed` nor `nnUNet_results` belongs under DVC. Both are derived — the reproducible artifacts are the raw cohort pointer, the code commit, and the plans file.
+
+### MLflow on a headless box
+
+The MLflow section above sets up a shared server; for a single-user box a **file store is simpler and sufficient**, and it survives having no database to back up:
+
+```bash
+export MLFLOW_TRACKING_URI="file:/data/repos/<repo>/mlruns"
+export MLFLOW_ALLOW_FILE_STORE=true        # mlflow >= 3.15 gates the file store behind this
+export MLFLOW_EXPERIMENT=spine-seg
+```
+
+`MLFLOW_ALLOW_FILE_STORE` is the one that wastes an afternoon: without it recent MLflow refuses the `file:` backend with an error that reads like a configuration mistake rather than an opt-out.
+
+nnU-Net has no MLflow integration; tracking comes from a trainer subclass that logs on `on_train_start` / `on_epoch_end` / `on_train_end`. The pattern that works well is to **gate it behind an environment variable and make every MLflow call non-fatal** — a tracking-server hiccup must never take down a run that is twelve hours in:
+
+```python
+def _enabled(self):
+    return os.environ.get("TRAIN_MLFLOW") == "1"
+
+def on_train_start(self):
+    super().on_train_start()
+    if not self._enabled():
+        return
+    try:
+        import mlflow
+        mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT", "default"))
+        run = mlflow.start_run(run_name=os.environ.get("MLFLOW_RUN_NAME"))
+        mlflow.log_params({"trainer": type(self).__name__, "fold": self.fold,
+                           "num_epochs": self.num_epochs, "initial_lr": self.initial_lr,
+                           "patch_size": str(self.configuration_manager.patch_size),
+                           "batch_size": self.configuration_manager.batch_size})
+        # write the run id somewhere the launcher can find it
+        if (p := os.environ.get("MLFLOW_RUN_ID_FILE")):
+            Path(p).write_text(run.info.run_id)
+        self._mlf = mlflow
+    except Exception as e:
+        self.print_to_log_file(f"mlflow disabled ({e})")
+        self._mlf = None
+```
+
+Per epoch, log `train_loss`, `val_loss`, `mean_fg_dice`, `ema_fg_dice`, `lr`, and `epoch_time_s` — the last one because it is what tells you a run has started thrashing before the loss does.
+
+**Log the data pointer, not the data path.** `mlflow.log_artifact("cohortA/nifti.dvc")` records the content hash of the exact cohort; a directory path records a name someone can overwrite next month. With the git SHA, that pair is what makes the run reconstructable: commit gives code, pointer gives data, `dvc pull` turns the pointer back into bytes.
+
+### Reaching the UI from your laptop
+
+For a file store, the UI is a reader process pointed at the same directory:
+
+```bash
+mlflow ui --backend-store-uri "file:/data/repos/<repo>/mlruns" \
+          --host 127.0.0.1 --port 5000
+```
+
+Keep `--host 127.0.0.1`. Default MLflow has **no authentication**, so `--host 0.0.0.0` on a box with a routable address publishes every run, and the delete button, to anyone who finds the port. Reach it by forwarding instead:
+
+```bash
+# from the laptop
+ssh -N -L 5000:127.0.0.1:5000 <user>@<box>
+```
+
+Then browse `http://127.0.0.1:5000`. If 5000 is taken locally, change **only** the left number: `-L 5001:127.0.0.1:5000`. The right-hand side is an address on the box and stays 5000 — swapping those two is the usual reason a tunnel connects but the page never loads. Put it in the laptop's `~/.ssh/config` as a `LocalForward` so it comes up with every connection.
+
+To keep the viewer running across logins, make it a user unit as in the MLflow section — and see the linger note below, which applies to it too.
+
+### Launch a run that survives the disconnect
+
+Three mechanisms, and they are not interchangeable.
+
+**tmux** — for interactive work you intend to watch. Survives a dropped connection, not a reboot, and not a killed tmux server. Covered above; the trap worth repeating is that a session started last week does not have the environment variables you added to `~/.bashrc` yesterday, which is the usual source of `KeyError: 'nnUNet_raw'` in a long-lived pane.
+
+**A transient systemd unit** — for a real training run. This is the better default on a headless box: the job is supervised, its output goes to the journal, it gets a memory budget, and it has no relationship to any terminal.
+
+```bash
+systemd-run --user --slice=compute.slice --unit=train-501-f0 \
+  --working-directory="$PWD" \
+  --setenv=nnUNet_raw --setenv=nnUNet_preprocessed --setenv=nnUNet_results \
+  --setenv=TRAIN_MLFLOW=1 --setenv=MLFLOW_ALLOW_FILE_STORE=true \
+  --setenv=MLFLOW_TRACKING_URI --setenv=MLFLOW_EXPERIMENT \
+  --setenv=MLFLOW_RUN_NAME=d501-fold0-250ep \
+  --setenv=nnUNet_n_proc_DA=6 \
+  /data/repos/<repo>/.venv/bin/nnUNetv2_train 501 3d_fullres 0
+```
+
+Give `systemd-run` an **absolute path to the executable**. It does not inherit your shell's `PATH` lookup, and a bare command name fails with a bewildering `203/EXEC`. Environment variables are not inherited either — `--setenv=NAME` with no value forwards the current one, which keeps the command readable.
+
+**Do not run an unbounded training job in your login scope.** On Ubuntu, `systemd-oomd` watches memory pressure at `user@.service` and kills by pressure, not by who caused it — so an nnU-Net job that eats all the RAM gets the *desktop session* killed instead of itself. A dedicated slice with a hard ceiling makes the job die on its own budget:
+
+```ini
+# ~/.config/systemd/user/compute.slice
+[Unit]
+Description=Bounded slice for long-running ML training/eval jobs
+[Slice]
+MemoryMax=20G        # leave the rest of RAM for everything else
+MemorySwapMax=0      # swap thrash is what makes a box unusable for hours
+```
+
+Set `MemoryMax` and **not** `MemoryHigh`. Measured on this pattern: `MemoryHigh` together with `MemorySwapMax=0` livelocks an allocation-heavy ML job instead of killing it — with no swap and little page cache there is nothing to reclaim, so the kernel throttles the allocator indefinitely and the job hangs at ~62% stall with zero OOM kills. `MemoryMax` alone gives a clean cgroup kill at the boundary, which is the behaviour you want. A job that exceeded its budget reports `Result=oom-kill`; that is the system working, and the response is to raise the cap deliberately or shrink the job.
+
+`nnUNet_n_proc_DA` is the matching knob on the job side: the default 12 augmentation workers each hold a copy of the batch pipeline, and dropping to 6 is usually the difference between fitting the cap and not.
+
+**Enable lingering, or none of this survives logging out.** User units — transient ones from `systemd-run --user` and the MLflow service alike — are torn down when your last session ends unless the user is allowed to linger. On a headless box you will log out, and this is the step people discover afterwards:
+
+```bash
+loginctl enable-linger "$USER"
+loginctl show-user "$USER" --property=Linger      # expect Linger=yes
+```
+
+**`nohup … &`** is the fallback when neither is available. It survives the hangup and nothing else: no supervision, no memory bound, no journal, and no record of the exit status. Redirect both streams (`nohup cmd > train.log 2>&1 &`) and treat it as a last resort.
+
+- [ ] `loginctl show-user "$USER" --property=Linger` reports `Linger=yes`
+- [ ] a deliberate `ssh` disconnect, then reconnect, and the job is still running
+
+### Watch it
+
+```bash
+journalctl --user -u train-501-f0 -f           # live output
+systemctl --user status train-501-f0
+systemctl --user show train-501-f0 -p MemoryPeak -p Result
+nvidia-smi dmon                                 # or nvtop
+watch -n 300 df -h /data                        # the run that dies at 3am dies of disk
+```
+
+nnU-Net also writes a per-fold `progress.png` and a training log under `$nnUNet_results/Dataset501_.../`, which is the fastest way to see the loss curve without leaving the terminal. Rendering curves from MLflow needs `matplotlib.use("Agg")` before importing pyplot — there is no display on a headless box, and the default backend fails with an error about `$DISPLAY` that looks unrelated to plotting.
+
+Free disk is the one to alarm on. Checkpoints, preprocessed data, and the DVC cache all grow on the same volume, and a training run that fills the disk corrupts the checkpoint it was writing at the time.
+
+### When it dies
+
+```bash
+systemctl --user show train-501-f0 -p Result -p ExecMainStatus
+nnUNetv2_train 501 3d_fullres 0 --c            # resume from the last checkpoint
+```
+
+`Result=oom-kill` means the cgroup cap; `ExecMainStatus=1` with a CUDA out-of-memory in the journal is the GPU rather than RAM, and needs a smaller patch or batch size in the plans file rather than a bigger `MemoryMax`. `--c` continues from `checkpoint_latest.pth`, which nnU-Net writes every 50 epochs by default — long enough that an unlucky crash costs real time, and worth lowering if the box is unstable.
+
+A resumed run starts a **new MLflow run** unless you pass the previous run id back in. If the launcher wrote one via `MLFLOW_RUN_ID_FILE`, reuse it, or accept two run records for one training and note the relationship in the run name.
+
+### Checklist
+
+- [ ] `DS_DATAKIT_DATA_ROOT` on the data disk, same filesystem as the DVC cache
+- [ ] patient grouping verified at registration — patient count, not file count
+- [ ] pseudonyms opaque; the ID map written outside the data root and out of git
+- [ ] labels attached with `--image` so geometry was actually checked
+- [ ] `track` re-run **after** labelling; `dvc status -c` clean before push
+- [ ] `qc_cohort.py` exits 0 across all cohorts being combined
+- [ ] labelmaps identical across cohorts; no shared patients; no duplicate scans
+- [ ] `splits_final.json` written **after** preprocessing, patient-disjoint
+- [ ] `--channel-name CT` for CT, so normalisation is the global scheme
+- [ ] MLflow logs the `.dvc` pointer and the git SHA, not a directory path
+- [ ] MLflow bound to `127.0.0.1`, reached over an SSH tunnel
+- [ ] `loginctl enable-linger` set, and a disconnect test actually performed
+- [ ] `compute.slice` has `MemoryMax` and no `MemoryHigh`
+- [ ] free disk alarmed on, not merely observed
 - [ ] first run logs `git_sha` and the `.dvc` pointer, not a data path

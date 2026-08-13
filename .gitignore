@@ -1,0 +1,5 @@
+# Derived from README.md by scripts/build_pdf.py — regenerate, don't commit
+*.pdf
+
+__pycache__/
+*.pyc
