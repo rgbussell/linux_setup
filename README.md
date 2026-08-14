@@ -1489,6 +1489,34 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 
 `torch.cuda.is_available()` returning `False` here is worth stopping for. nnU-Net will fall back to CPU and "train" at roughly a hundredth of the speed, which reads as a slow box rather than a broken install.
 
+### Where MLflow lives
+
+MLflow is two things with different lifetimes, and installing both in the same place is a mistake that only shows up later.
+
+**The client belongs in the project venv.** `import mlflow` runs inside the training process, so it has to be in the environment nnU-Net is running from — that is the `uv pip install … mlflow` above, and there is nothing more to decide.
+
+**The server does not.** It is a long-running service with no relationship to any one project. Installing it into a project venv couples its lifetime to that project's environment: a dependency resolving differently on the next `uv pip install -e .`, or a rebuilt venv, takes the tracking server down with it. The venv is a gitignored build artifact, so a rebuild silently deletes the binary the service unit points at.
+
+Give it an isolated install with a stable entry point instead:
+
+```bash
+uv tool install mlflow          # needs uv >= 0.3; `uv tool upgrade mlflow` later
+which mlflow                    # ~/.local/bin/mlflow — project-independent
+```
+
+A dedicated venv does the same job without adding a tool manager:
+
+```bash
+uv venv /opt/mlflow/.venv --python 3.11
+uv pip install --python /opt/mlflow/.venv/bin/python mlflow
+```
+
+Either way the service unit references it by absolute path, which it has to do regardless — systemd inherits no `PATH`.
+
+**Do not `sudo pip install mlflow`.** On Ubuntu 23.04 and newer, PEP 668 rejects it outright with `externally-managed-environment`; where it is not rejected it puts you in conflict with apt-managed packages, which is worse because it fails later.
+
+**Keep the two versions roughly aligned.** Client and server talk over a REST API that has changed across major versions, and a 2.x client against a 3.x server fails at `log_metrics` rather than at connect time — twenty minutes into a run, not at launch. Pin both and upgrade them together.
+
 ```bash
 export nnUNet_raw=/data/nnunet/raw
 export nnUNet_preprocessed=/data/nnunet/preprocessed
@@ -1548,7 +1576,7 @@ As a user unit so it survives logout:
 [Unit]
 Description=MLflow tracking server
 [Service]
-ExecStart=/data/repos/<repo>/.venv/bin/mlflow server \
+ExecStart=%h/.local/bin/mlflow server \
   --backend-store-uri sqlite:////data/mlflow/mlflow.db \
   --artifacts-destination /data/mlflow/artifacts \
   --host 127.0.0.1 --port 5000
@@ -1556,6 +1584,8 @@ Restart=on-failure
 [Install]
 WantedBy=default.target
 ```
+
+`ExecStart` points at the **standalone** install from *Where MLflow lives*, not at a project venv. Pointing it into `/data/repos/<repo>/.venv/bin/mlflow` is the tempting version and the wrong one: rebuilding that project's environment deletes the binary, systemd reports `203/EXEC`, and — because tracking is deliberately non-fatal — training carries on recording nothing at all.
 
 ```bash
 loginctl enable-linger "$USER"          # without this, logging out kills it
@@ -1741,6 +1771,7 @@ nnUNetv2_train 501 3d_fullres 0 -tr nnUNetTrainer_mlflow --c
 ### Checklist
 
 - [ ] `torch.cuda.is_available()` is `True` before anything long is started
+- [ ] MLflow **client** in the project venv, **server** installed outside it
 - [ ] `channel_names` set to `"CT"` for CT, so normalisation is the global scheme
 - [ ] `sqlite:////` with four slashes; the `.db` file is backed up
 - [ ] one fold at a time on SQLite, or Postgres before running folds in parallel
