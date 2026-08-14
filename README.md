@@ -1469,4 +1469,285 @@ A resumed run starts a **new MLflow run** unless you pass the previous run id ba
 - [ ] `loginctl enable-linger` set, and a disconnect test actually performed
 - [ ] `compute.slice` has `MemoryMax` and no `MemoryHigh`
 - [ ] free disk alarmed on, not merely observed
+
+---
+
+## nnU-Net training with an MLflow tracking server
+
+The section above logs to a **file store**, which is the right default for one person on one box. This one runs an actual **tracking server** — the version you want when runs come from more than one repo, when you want the UI live while training, or when a model registry is in the future.
+
+It is otherwise the same training. The differences that matter are the three places nnU-Net actively resists being instrumented, and all three are silent failures.
+
+### Install
+
+```bash
+uv venv --python 3.11 && source .venv/bin/activate
+uv pip install torch --index-url https://download.pytorch.org/whl/cu124   # match your driver
+uv pip install nnunetv2==2.8.1 mlflow
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+`torch.cuda.is_available()` returning `False` here is worth stopping for. nnU-Net will fall back to CPU and "train" at roughly a hundredth of the speed, which reads as a slow box rather than a broken install.
+
+```bash
+export nnUNet_raw=/data/nnunet/raw
+export nnUNet_preprocessed=/data/nnunet/preprocessed
+export nnUNet_results=/data/nnunet/results
+```
+
+Put all three on the data disk and add them to `~/.bashrc`. A tmux pane opened before you did that will not have them — the recurring source of `KeyError: 'nnUNet_raw'`.
+
+### The dataset
+
+nnU-Net reads exactly one layout, and `--verify_dataset_integrity` is the cheapest check you will ever run:
+
+```
+$nnUNet_raw/Dataset501_Name/
+  imagesTr/<case>_0000.nii.gz     # _0000 is the channel index, not optional
+  labelsTr/<case>.nii.gz          # same filename, no channel suffix
+  dataset.json
+```
+
+```json
+{
+  "channel_names": {"0": "CT"},
+  "labels": {"background": 0, "vertebra": 1, "disc": 2},
+  "numTraining": 100,
+  "file_ending": ".nii.gz"
+}
+```
+
+`labels` maps **name to value**. `channel_names` selects the normalisation scheme: `"CT"` triggers global foreground-percentile normalisation computed across the dataset; anything else falls back to per-image z-score. For CT the global scheme is what preserves Hounsfield meaning, and getting it wrong costs accuracy without erroring.
+
+```bash
+nnUNetv2_plan_and_preprocess -d 501 --verify_dataset_integrity
+```
+
+Budget two to four times the raw cohort for preprocessed output, and check `df -h` before and after so the growth rate is a measurement.
+
+### Stand up the tracking server
+
+SQLite backend, artifacts on the data disk, bound to loopback:
+
+```bash
+mkdir -p /data/mlflow/artifacts
+mlflow server \
+  --backend-store-uri sqlite:////data/mlflow/mlflow.db \
+  --artifacts-destination /data/mlflow/artifacts \
+  --host 127.0.0.1 --port 5000
+```
+
+Note the **four** slashes in `sqlite:////data/...` — three for the scheme plus the leading `/` of an absolute path. Three slashes means a path relative to the working directory, which is how you end up with several `mlflow.db` files and runs that appear to vanish.
+
+**That database is the system of record.** It is not reconstructable from the artifacts and it is not in git. Back it up.
+
+As a user unit so it survives logout:
+
+```ini
+# ~/.config/systemd/user/mlflow.service
+[Unit]
+Description=MLflow tracking server
+[Service]
+ExecStart=/data/repos/<repo>/.venv/bin/mlflow server \
+  --backend-store-uri sqlite:////data/mlflow/mlflow.db \
+  --artifacts-destination /data/mlflow/artifacts \
+  --host 127.0.0.1 --port 5000
+Restart=on-failure
+[Install]
+WantedBy=default.target
+```
+
+```bash
+loginctl enable-linger "$USER"          # without this, logging out kills it
+systemctl --user daemon-reload
+systemctl --user enable --now mlflow
+curl -sf http://127.0.0.1:5000/health && echo " mlflow ok"
+```
+
+Then point clients at it, and view it over an SSH tunnel (`ssh -N -L 5000:127.0.0.1:5000 <user>@<box>`) rather than rebinding to `0.0.0.0` — default MLflow has no authentication.
+
+```bash
+export MLFLOW_TRACKING_URI=http://127.0.0.1:5000
+```
+
+`MLFLOW_ALLOW_FILE_STORE` is **not** needed here. That variable gates `file:` URIs only; setting it against a server is harmless but signals a confusion worth not having.
+
+**SQLite is single-writer.** Training one fold at a time is fine. Launch four folds concurrently and metric writes start colliding with `database is locked`, which surfaces as gaps in the curves rather than a crash. If you intend to run folds in parallel, move the backend to Postgres before you do, not after.
+
+### Instrument the trainer
+
+nnU-Net has no MLflow integration and no callback system, so tracking means subclassing the trainer and overriding three lifecycle hooks. Two rules make this survivable: **gate it behind an environment variable**, and **make every MLflow call non-fatal** — a server hiccup must never kill a run that is twelve hours in.
+
+```python
+# src/<pkg>/trainers.py
+import os
+from pathlib import Path
+import torch
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+
+
+class _MLflowMixin:
+    _mlf = None
+
+    def _enabled(self) -> bool:
+        return os.environ.get("TRAIN_MLFLOW") == "1"
+
+    def on_train_start(self):
+        super().on_train_start()
+        if not self._enabled():
+            return
+        try:
+            import mlflow
+            mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT", "default"))
+            run = mlflow.start_run(run_name=os.environ.get("MLFLOW_RUN_NAME"))
+            self._mlf = mlflow
+            mlflow.log_params({
+                "trainer": type(self).__name__,
+                "dataset": self.plans_manager.dataset_name,
+                "configuration": self.configuration_name,
+                "fold": self.fold,
+                "num_epochs": self.num_epochs,
+                "initial_lr": self.initial_lr,
+                "patch_size": str(self.configuration_manager.patch_size),
+                "batch_size": self.configuration_manager.batch_size,
+            })
+            if (p := os.environ.get("MLFLOW_RUN_ID_FILE")):
+                Path(p).write_text(run.info.run_id)
+            self.print_to_log_file(f"mlflow run_id={run.info.run_id}")
+        except Exception as e:
+            self.print_to_log_file(f"mlflow disabled ({e})")
+            self._mlf = None
+
+    def on_epoch_end(self):
+        super().on_epoch_end()
+        if self._mlf is None:
+            return
+        try:
+            log = getattr(self.logger, "my_fantastic_logging", None)
+            if log is None:                       # v2.7+ wraps it in a MetaLogger
+                log = self.logger.local_logger.my_fantastic_logging
+            ep = self.current_epoch - 1           # super() already advanced it
+            metrics = {}
+            for key, name in (("train_losses", "train_loss"),
+                              ("val_losses", "val_loss"),
+                              ("ema_fg_dice", "ema_fg_dice"),
+                              ("mean_fg_dice", "mean_fg_dice"),
+                              ("lrs", "lr")):
+                if log.get(key):
+                    metrics[name] = float(log[key][-1])
+            if log.get("epoch_end_timestamps") and log.get("epoch_start_timestamps"):
+                metrics["epoch_time_s"] = float(
+                    log["epoch_end_timestamps"][-1] - log["epoch_start_timestamps"][-1])
+            self._mlf.log_metrics(metrics, step=max(ep, 0))
+        except Exception as e:
+            self.print_to_log_file(f"mlflow epoch log failed ({e})")
+
+    def on_train_end(self):
+        super().on_train_end()
+        if self._mlf is None:
+            return
+        try:
+            p = os.path.join(self.output_folder, "progress.png")
+            if os.path.isfile(p):
+                self._mlf.log_artifact(p)
+            self._mlf.end_run()
+        except Exception as e:
+            print(f"mlflow finalize failed ({e})")
+
+
+class nnUNetTrainer_mlflow(_MLflowMixin, nnUNetTrainer):
+    # The signature must match nnUNetTrainer.__init__ EXACTLY.
+    def __init__(self, plans: dict, configuration: str, fold: int,
+                 dataset_json: dict, device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+```
+
+**That `__init__` signature is a trap, not a style choice.** nnU-Net introspects `inspect.signature(self.__init__)` and then reads each named parameter out of `locals()`. A conventional `*args, **kwargs` passthrough raises `KeyError` at construction, before training starts, with a message that points nowhere near the cause.
+
+Two smaller ones. `on_epoch_end` runs *after* `super()` has already incremented `current_epoch`, so the step index is `current_epoch - 1` or every metric is off by one. And nnU-Net's logger moved: `my_fantastic_logging` is a direct attribute on the classic `nnUNetLogger` but lives on `logger.local_logger` under the v2.7 `MetaLogger` layout, so read it defensively across versions.
+
+Log `epoch_time_s` even though it looks like noise. It is the first signal that a run has started thrashing — it climbs well before the loss curve shows anything.
+
+### Make nnU-Net find your trainer
+
+**nnU-Net's class discovery only scans the installed `nnunetv2` package tree.** A trainer in your own package is invisible to `nnUNetv2_train -tr`, and the error says the trainer does not exist rather than that it could not be imported. There is no plugin hook and no environment variable for this.
+
+The workaround that keeps your code as the single source of truth is a generated shim inside the nnU-Net package that re-exports your classes:
+
+```python
+def install_trainer_shim() -> None:
+    """Expose our trainers to nnU-Net's class search. Idempotent."""
+    import nnunetv2
+    shim = (Path(nnunetv2.__file__).parent / "training" / "nnUNetTrainer"
+            / "variants" / "local_trainers.py")
+    body = (
+        "# AUTO-GENERATED -- do not edit. Real source: src/<pkg>/trainers.py\n"
+        "from <pkg>.trainers import nnUNetTrainer_mlflow  # noqa: F401\n"
+    )
+    if not shim.is_file() or shim.read_text() != body:
+        shim.write_text(body)
+```
+
+Call it from your launcher before invoking `nnUNetv2_train`. Rewriting whenever it drifts matters because the venv is a build artifact — a rebuilt environment loses the shim, and a stale one silently trains the wrong class.
+
+Copying the trainer file into the nnU-Net tree instead works and is worse: it drifts against your repo the first time you edit one copy.
+
+### Launch it
+
+The server must be up **before** the run starts. Tracking is non-fatal by design, so a down server produces a training run with no record rather than an error.
+
+```bash
+curl -sf http://127.0.0.1:5000/health || systemctl --user start mlflow
+
+systemd-run --user --slice=compute.slice --unit=train-501-f0 \
+  --working-directory="$PWD" \
+  --setenv=nnUNet_raw --setenv=nnUNet_preprocessed --setenv=nnUNet_results \
+  --setenv=TRAIN_MLFLOW=1 \
+  --setenv=MLFLOW_TRACKING_URI=http://127.0.0.1:5000 \
+  --setenv=MLFLOW_EXPERIMENT=spine-seg \
+  --setenv=MLFLOW_RUN_NAME=d501-fold0-1000ep \
+  --setenv=MLFLOW_RUN_ID_FILE=/tmp/train-501-f0.runid \
+  --setenv=nnUNet_n_proc_DA=6 \
+  /data/repos/<repo>/.venv/bin/nnUNetv2_train 501 3d_fullres 0 -tr nnUNetTrainer_mlflow
+```
+
+`systemd-run` inherits neither `PATH` nor the environment, which is why the executable is an absolute path and every variable is forwarded explicitly. `--setenv=NAME` with no value passes the current value through. See the detached-run subsection above for the slice, the memory cap, and `enable-linger`.
+
+- [ ] `journalctl --user -u train-501-f0 -f` shows `mlflow run_id=...` in the first minute
+
+That line is the confirmation. Its absence means tracking silently disabled itself and the run is producing nothing but checkpoints.
+
+### Verify, then watch
+
+```bash
+journalctl --user -u train-501-f0 -f
+systemctl --user show train-501-f0 -p MemoryPeak -p Result
+nvidia-smi dmon
+watch -n 300 df -h /data
+```
+
+nnU-Net writes `progress.png` and a text log under `$nnUNet_results/Dataset501_.../nnUNetTrainer_mlflow__nnUNetPlans__3d_fullres/fold_0/`, which is the fastest loss curve to reach without leaving the terminal. The MLflow UI over the tunnel is the one to use when comparing runs rather than watching one.
+
+### Resume
+
+```bash
+nnUNetv2_train 501 3d_fullres 0 -tr nnUNetTrainer_mlflow --c
+```
+
+`--c` continues from `checkpoint_latest.pth`, written every 50 epochs by default. A resumed run **starts a new MLflow run** unless you feed the old id back in — that is what `MLFLOW_RUN_ID_FILE` is for. Either reuse it with `mlflow.start_run(run_id=...)`, or accept two records for one training and encode the relationship in the run name.
+
+`Result=oom-kill` is the cgroup cap and is fixed by raising `MemoryMax` or lowering `nnUNet_n_proc_DA`. A CUDA out-of-memory in the journal is the GPU instead, and needs a smaller patch or batch size in the plans file — a bigger `MemoryMax` will not touch it.
+
+### Checklist
+
+- [ ] `torch.cuda.is_available()` is `True` before anything long is started
+- [ ] `channel_names` set to `"CT"` for CT, so normalisation is the global scheme
+- [ ] `sqlite:////` with four slashes; the `.db` file is backed up
+- [ ] one fold at a time on SQLite, or Postgres before running folds in parallel
+- [ ] server bound to `127.0.0.1`, reached over an SSH tunnel
+- [ ] trainer `__init__` signature matches `nnUNetTrainer.__init__` exactly
+- [ ] shim regenerated by the launcher, not hand-copied into the venv
+- [ ] every MLflow call wrapped so it can fail without ending the run
+- [ ] `mlflow run_id=...` seen in the journal within the first minute
+- [ ] `loginctl enable-linger` set, so the server and the job survive logout
 - [ ] first run logs `git_sha` and the `.dvc` pointer, not a data path
