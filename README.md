@@ -1782,3 +1782,257 @@ nnUNetv2_train 501 3d_fullres 0 -tr nnUNetTrainer_mlflow --c
 - [ ] `mlflow run_id=...` seen in the journal within the first minute
 - [ ] `loginctl enable-linger` set, so the server and the job survive logout
 - [ ] first run logs `git_sha` and the `.dvc` pointer, not a data path
+
+---
+
+## Several trainings, and results that survive being re-run
+
+One run is the easy case. The moment there is a second one — a different seed, a longer schedule, a rerun after a bug fix — two problems appear that have nothing to do with model quality.
+
+### nnU-Net overwrites results in place
+
+This is the one to internalise before anything else. Results are written to a path built entirely from the **trainer class, plans name, and configuration**:
+
+```
+$nnUNet_results/Dataset501_Name/<trainer>__<plans>__<config>/fold_0/
+```
+
+There is no run id, no timestamp, and no counter in that path. Re-running the same trainer on the same configuration and fold **silently overwrites the previous checkpoints, logs, and validation output**. A 1000-epoch baseline you spent two GPU-days on is gone the moment you rerun it to "check something," and the failure is invisible: the directory still exists and still looks complete.
+
+Two ways out, and they are not equivalent.
+
+**A distinct trainer class per variant** — one subclass per experimental arm, even when the code is identical:
+
+```python
+class nnUNetTrainer_baseline(nnUNetTrainer_mlflow):
+    """Identical behaviour; a distinct class name so a matched baseline lands in
+    its own results dir instead of overwriting the reference run."""
+
+class nnUNetTrainer_seedA(nnUNetTrainer_mlflow): ...
+class nnUNetTrainer_seedB(nnUNetTrainer_mlflow): ...
+```
+
+Each produces `nnUNetTrainer_seedA__nnUNetPlans__3d_fullres/`, side by side, comparable forever. This is the approach to prefer: the separation is structural, so it cannot be forgotten under time pressure.
+
+**Or archive before re-running**, which relies on discipline and therefore eventually fails:
+
+```bash
+RUN=$nnUNet_results/Dataset501_Name/nnUNetTrainer_mlflow__nnUNetPlans__3d_fullres
+[ -d "$RUN" ] && mv "$RUN" "$RUN.$(date +%Y%m%d-%H%M)"
+```
+
+- [ ] before any rerun: does a directory with that exact trainer/plans/config name already exist?
+
+### Running more than one at a time
+
+**On a single GPU, do not.** Two nnU-Net trainings on one card either fail with CUDA out-of-memory or thrash so badly both finish slower than they would have run in sequence. Serialise them in one detached unit instead:
+
+```bash
+cat > /data/repos/<repo>/queue.sh <<'EOF'
+#!/usr/bin/env bash
+set -u                      # deliberately NOT -e: one failure must not skip the rest
+for fold in 0 1 2 3 4; do
+  MLFLOW_RUN_NAME="d501-3d_fullres-f${fold}" \
+  nnUNetv2_train 501 3d_fullres "$fold" -tr nnUNetTrainer_mlflow
+  echo "fold ${fold} exited ${?}"
+done
+EOF
+chmod +x /data/repos/<repo>/queue.sh
+
+systemd-run --user --slice=compute.slice --unit=train-501-all \
+  --working-directory=/data/repos/<repo> \
+  --setenv=nnUNet_raw --setenv=nnUNet_preprocessed --setenv=nnUNet_results \
+  --setenv=TRAIN_MLFLOW=1 --setenv=MLFLOW_TRACKING_URI --setenv=MLFLOW_EXPERIMENT \
+  /data/repos/<repo>/queue.sh
+```
+
+One unit, one journal, five runs, and a machine that is never oversubscribed. Leaving `set -e` out is deliberate — with it, fold 1 crashing means folds 2 through 4 never run, and you discover that the next morning.
+
+**With more than one GPU**, one unit per card, pinned:
+
+```bash
+systemd-run --user --slice=compute.slice --unit=train-f0 \
+  --setenv=CUDA_VISIBLE_DEVICES=0 ... nnUNetv2_train 501 3d_fullres 0 -tr nnUNetTrainer_mlflow
+systemd-run --user --slice=compute.slice --unit=train-f1 \
+  --setenv=CUDA_VISIBLE_DEVICES=1 ... nnUNetv2_train 501 3d_fullres 1 -tr nnUNetTrainer_mlflow
+```
+
+Two things bite here. `compute.slice`'s `MemoryMax` is a **shared** ceiling across every job in it, so two jobs at 20G do not get 20G each — they get 20G between them and one dies. Give each a per-job budget with `--property=MemoryMax=…`, sized so the total still fits the box. And host RAM scales with jobs, not cards: each run spawns its own `nnUNet_n_proc_DA` augmentation workers, so halve that value when doubling the jobs.
+
+**SQLite will not take concurrent runs.** Metric writes from parallel folds collide as `database is locked`, and because MLflow calls are non-fatal by design that shows up as *gaps in the curves*, not an error. Move the backend before running folds in parallel:
+
+```bash
+mlflow server --backend-store-uri postgresql://mlflow@127.0.0.1:5432/mlflow \
+  --artifacts-destination /data/mlflow/artifacts --host 127.0.0.1 --port 5000
+```
+
+### Making runs comparable later
+
+A run you cannot find is a run you did not do. Three habits cost nothing at write time and are unrecoverable afterwards.
+
+**Name runs from their content**, not their order: `d501-3d_fullres-f0-seedA-1000ep` beats `run-14`. The name is what you scan in the UI.
+
+**Tag the things you will filter on.** Parameters describe the model; tags describe the experiment:
+
+```python
+mlflow.set_tags({
+    "git_sha": subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip(),
+    "dataset": "Dataset501_SpineCombined",
+    "cohorts": "cohortA+cohortB",
+    "arm": "seedA",
+})
+```
+
+**Log a final summary metric, not only per-epoch curves.** MLflow's run table shows the *last* value of each metric, so a run whose best epoch was 780 out of 1000 is listed by whatever epoch 1000 happened to produce. An explicit `mlflow.log_metric("best_mean_fg_dice", best)` at `on_train_end` is what makes the table sortable and honest.
+
+Then the comparison is a query rather than an archaeology exercise:
+
+```python
+import mlflow
+runs = mlflow.search_runs(
+    experiment_names=["spine-seg"],
+    filter_string="tags.dataset = 'Dataset501_SpineCombined' and tags.arm != 'smoke'",
+    order_by=["metrics.best_mean_fg_dice DESC"],
+)
+print(runs[["tags.mlflow.runName", "metrics.best_mean_fg_dice", "tags.git_sha"]].head())
+```
+
+**The model registry needs the database backend.** It does not work against a `file:` store at all — which is the strongest practical argument for running the server rather than the file store as soon as you have models worth naming:
+
+```python
+mlflow.register_model(f"runs:/{run_id}/model", "spine-seg-3d_fullres")
+```
+
+- [ ] a distinct trainer class (or an archived directory) per experimental arm
+- [ ] one GPU means one training at a time, serialised in a single unit
+- [ ] per-job `MemoryMax` when jobs share the slice; `nnUNet_n_proc_DA` halved per extra job
+- [ ] Postgres before parallel folds, not after the curves develop gaps
+- [ ] every run tagged with `git_sha` and the dataset, and a final summary metric logged
+
+---
+
+## Backing up to S3
+
+The runbook says "back it up" about the MLflow database twice without saying how. This is how, and it starts with deciding what is actually irreplaceable.
+
+### What to back up, and what not to
+
+| | Regenerable? | Back up? |
+|---|---|---|
+| MLflow DB + artifacts | **No** — not reconstructable from anything | **Yes**, this is the priority |
+| ID maps / crosswalks (outside the data root) | No | **Yes**, and note they are the sensitive ones |
+| `nnUNet_results` checkpoints | Only by re-training (GPU-days) | **Yes** — cheap to store, expensive to recreate |
+| Hand-written `splits_final.json`, plans edits | No, if hand-edited | Yes |
+| `nnUNet_preprocessed` | Yes, from raw + plans | No |
+| `nnUNet_raw` (symlinks into the DVC tree) | Yes, from the cohort | No |
+| DVC cache | It is already on the DVC remote | No |
+
+The distinction that matters: **DVC push is not a backup.** It versions data you deliberately tracked, on a remote you chose. It says nothing about the MLflow database, the ID maps, or the checkpoints — which is exactly the set that has no other copy.
+
+### The one thing you cannot do naively
+
+**Never `aws s3 cp` a live SQLite file.** MLflow writes to `mlflow.db` continuously; a byte-copy taken mid-transaction produces a file that restores as corrupt, and you find out on the day you need it. SQLite has a purpose-built consistent-snapshot command:
+
+```bash
+sqlite3 /data/mlflow/mlflow.db ".backup '/data/mlflow/snapshots/mlflow.db'"
+# or, SQLite >= 3.27, which also compacts:
+sqlite3 /data/mlflow/mlflow.db "VACUUM INTO '/data/mlflow/snapshots/mlflow.db'"
+```
+
+Both are safe against a running server. Back up the *snapshot*, never the live file.
+
+This needs the `sqlite3` CLI, which is not in the Step 1 base packages and is not the Python `sqlite3` module — `sudo apt install -y sqlite3` on a fresh box, or it is already present inside a conda environment.
+
+### The sync
+
+Bucket creation, encryption, versioning, and IAM are all in Step 7 — reuse that bucket or make a sibling. Versioning is not optional here; it is what makes a bad sync recoverable.
+
+```bash
+#!/usr/bin/env bash
+# /data/repos/<repo>/scripts/backup.sh
+set -euo pipefail
+BUCKET=s3://<bucket>/backup/$(hostname -s)
+
+mkdir -p /data/mlflow/snapshots
+sqlite3 /data/mlflow/mlflow.db ".backup '/data/mlflow/snapshots/mlflow.db'"
+
+aws s3 sync /data/mlflow/snapshots  "$BUCKET/mlflow/"     --only-show-errors
+aws s3 sync /data/mlflow/artifacts  "$BUCKET/artifacts/"  --only-show-errors
+aws s3 sync /data/private           "$BUCKET/private/"    --only-show-errors
+aws s3 sync /data/nnunet/results    "$BUCKET/results/"    --only-show-errors \
+  --exclude '*/validation_raw/*' --storage-class STANDARD_IA
+
+echo "backup ok: $(date -Is)"
+```
+
+**`--delete` is deliberately absent.** It makes the remote mirror the local tree, which is correct for a mirror and catastrophic for a backup: a local disk that fails half-way, or a directory deleted by mistake, propagates the deletion to the only other copy on the next run. Without it the bucket accumulates, and a lifecycle rule handles cost:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket <bucket> \
+  --lifecycle-configuration file://lifecycle.json    # e.g. IA at 30d, Glacier at 90d
+```
+
+`validation_raw` is excluded because it is large, per-fold, and regenerable from the checkpoint. `STANDARD_IA` on checkpoints costs roughly half of standard storage for data read a few times a year, which is what a checkpoint is.
+
+### On a schedule
+
+A backup that depends on remembering is not one. A user timer, with `Persistent=true` so a missed run fires after the box comes back:
+
+```ini
+# ~/.config/systemd/user/backup.service
+[Unit]
+Description=Back up MLflow, checkpoints, and ID maps to S3
+[Service]
+Type=oneshot
+ExecStart=/data/repos/<repo>/scripts/backup.sh
+```
+
+```ini
+# ~/.config/systemd/user/backup.timer
+[Unit]
+Description=Nightly backup
+[Timer]
+OnCalendar=daily
+Persistent=true
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now backup.timer
+systemctl --user list-timers backup.timer
+journalctl --user -u backup.service -n 20
+```
+
+`loginctl enable-linger` applies here too — without it the timer stops when you log out, which on a headless box means it effectively never runs.
+
+### Restore, before you need to
+
+**A backup you have never restored is a hypothesis.** Test it once, into a throwaway location, while nothing is on fire:
+
+```bash
+aws s3 sync s3://<bucket>/backup/<host>/mlflow /tmp/restore/mlflow
+sqlite3 /tmp/restore/mlflow/mlflow.db "PRAGMA integrity_check;"        # expect: ok
+sqlite3 /tmp/restore/mlflow/mlflow.db "SELECT count(*) FROM runs;"     # expect: > 0
+```
+
+If `integrity_check` returns anything but `ok`, the snapshot step is being skipped somewhere and you are copying the live file.
+
+### Before the first push of anything patient-derived
+
+The Step 6c questions apply unchanged: the bucket agreement, the de-identification status, and encryption at rest. Two specifics for this backup in particular — **the ID maps and crosswalks are the sensitive artifacts**, far more than the images, because they are what makes pseudonyms reversible. If they go to S3 at all, they go to a bucket whose access you can justify, and never to the same prefix you would share with a collaborator.
+
+`aws s3 sync` is an upload. It is not undone by deleting the local copy.
+
+### Checklist
+
+- [ ] the MLflow DB is snapshotted with `.backup`, never copied live
+- [ ] `PRAGMA integrity_check` on a restored copy returns `ok`
+- [ ] bucket versioning on, so a bad sync is recoverable
+- [ ] no `--delete` in a backup sync
+- [ ] `nnUNet_preprocessed` and the DVC cache deliberately excluded
+- [ ] timer enabled, lingering on, and `list-timers` shows a next run
+- [ ] a restore actually performed once, not merely planned
+- [ ] crosswalks/ID maps treated as the sensitive payload
