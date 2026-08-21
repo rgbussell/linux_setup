@@ -1,5 +1,7 @@
 # Linux ML Workstation Setup
 
+**Pinned versions, last checked 2026-08-16:** `nnunetv2==2.8.1` (latest), `mlflow==3.15.1` (latest), `TotalSegmentator==2.17.0` (2.18.0 is out; not yet checked against this nnU-Net pin). Pins are here so a run is reproducible, not because newer is broken — `pip index versions <pkg>` shows what has moved. Upgrade MLflow client and server together; they talk over a REST API that has changed across major versions.
+
 ## Step 1 — System packages
 
 ### 1a. Base packages
@@ -528,6 +530,174 @@ dvc status -c           # cache vs remote — exactly what a push would send
 du -sh data/raw         # bytes, not pointers
 ```
 
+### 7i. A DICOM cohort with ds-datakit — de-identify on the way in
+
+7h versions bytes as they sit. When the source is identifiable DICOM, the bytes must *not* reach DVC as they sit — de-identification has to happen on the way in, and the output should land in a layout that supports selective pull later. `ds-datakit` does ingest → de-id → DVC as one flow; this is the DICOM-source counterpart of the already-NIfTI registration covered further down ("A labelled NIfTI cohort, end to end" — its `ingest` is DICOM-only, which is why that section builds the manifest by hand).
+
+Three locations, one rule each:
+
+- the **source tree** — identifiable DICOM, organized one top-level directory per subject. Never modified; ingest only reads it.
+- the **data root** — where the de-identified output lands. *This* directory becomes the git + DVC repo, not the source tree and not the code repo.
+- the **crosswalk directory** — the encrypted pseudonym→case mapping. Outside both of the above; it is gitignored, dvcignored, and blocked by hooks, but the real protection is that it never sits under a tracked path at all.
+
+```bash
+python3 -m venv ~/venvs/dsdk && source ~/venvs/dsdk/bin/activate
+pip install "ds-datakit[dicom,itk,crypto,s3] @ git+ssh://git@<git-host>/<org>/ds-datakit.git"
+
+export DS_DATAKIT_DATA_ROOT=~/data/deid              # de-id output; becomes the DVC repo
+export DS_DATAKIT_CROSSWALK_DIR=~/secure/crosswalks  # NEVER inside the data root
+ds-datakit doctor                                    # prints the resolved paths — read them before ingesting
+```
+
+Create and harden the bucket exactly as in 7b (public-access block, default encryption, versioning). Then:
+
+```bash
+ds-datakit scan <source>/ --read-headers            # inventory + PHI findings; no writes
+ds-datakit init --remote s3://<bucket>/dvcstore     # data root → git + DVC + default remote
+ds-datakit ingest <source>/ --dataset <name> --subject-from dirname
+ds-datakit track --dataset <name>                   # one DVC chunk per study × representation
+cd "$DS_DATAKIT_DATA_ROOT" && git add -A && git commit -m "track <name>"
+ds-datakit push --dataset <name>                    # guarded: refuses if a crosswalk is in the tree
+```
+
+What each step is buying:
+
+**Pick the crosswalk password before `ingest` asks for it.** Ingest prompts for it (or reads `DS_DATAKIT_CROSSWALK_PASSWORD`); the crosswalk is the *only* path from pseudonyms back to cases, and a forgotten password is unrecoverable by design (AES-256-GCM, key derived from the password). Store the password in the password manager first, and back up `$DS_DATAKIT_CROSSWALK_DIR/<name>.crosswalk.enc` somewhere that is not the data root.
+
+**`scan` findings on the source are expected; `scan` on the output proves nothing.** The input scan tells you what PHI is present and whether any series are secondary-capture. The authority on the *output* is the verify gate inside `ingest` — it re-walks every de-identified instance (including nested sequences) and aborts the whole series transactionally on any finding, leaving no partial output. Running `scan` on de-identified output false-positives on the pseudonyms themselves.
+
+**Per-study chunks are the reason to `track` instead of `dvc add data/`.** Each study's `dicom/`, `nifti/`, and `labels-<task>/` directories become separate `.dvc` pointers, so a training box later runs `ds-datakit pull --dataset <name> --modality CT --rep nifti` and fetches exactly that — no all-or-nothing directory pull (compare the granularity discussion in 7h).
+
+**Know the de-id boundary.** The action table covers the header layer, including nested sequences and the write-the-original-back trap (`OriginalAttributesSequence`); pixels pass through untouched. CT and MR pixel data rarely carries identifiers, but if `scan` shows secondary-capture, ultrasound, or annotated screenshots, inspect them for burned-in text before anything is pushed — that redaction layer lives elsewhere.
+
+**The git repo at the data root holds pointers and a PHI-free manifest, not bytes** — but if you add a git remote for it, make it a private one. The manifest is de-identified; the repo's existence, dataset names, and study counts are still nobody's business.
+
+**Before the first push of anything patient-derived**, the 6c questions apply unchanged: whose bucket, under what agreement, and is de-identification *verified* (by the gate above) rather than assumed. `ds-datakit push` runs its own guard — crosswalk absent from the tree, a sampled de-id re-verify — but the governance questions are yours, not the tool's.
+
+Verify from a second angle once pushed:
+
+```bash
+dvc status -c                                        # cache vs remote — should be clean
+aws s3 ls s3://<bucket>/dvcstore/ --recursive | head # bytes actually landed
+ds-datakit card --dataset <name>                     # PHI-free card.yaml — counts to sanity-check
+ds-datakit query --dataset <name> --modality CT      # manifest answers clinical questions
+```
+
+### 7j. A scratch venv with a command-line DICOM header reader
+
+Before pointing ingest at a tree you have never looked inside, read a few headers by hand. pydicom ships a small CLI for exactly this, so a two-line venv is the whole setup:
+
+```bash
+python3 -m venv ~/venvs/dicom && source ~/venvs/dicom/bin/activate
+pip install pydicom
+```
+
+(If the 7i venv already exists, skip this — ds-datakit's `dicom` extra installed pydicom there, and the `pydicom` command with it.)
+
+```bash
+pydicom show <file.dcm>                    # full header dump — pixels are never loaded
+pydicom show -x <file.dcm>                 # exclude private tags
+pydicom show -t <file.dcm>                 # top level only — collapse sequence contents
+pydicom show "<file.dcm>::PatientName"     # a single element — keyword only, no (gggg,eeee) tag numbers
+pydicom show "<file.dcm>::RequestAttributesSequence[0]"   # inside a sequence item
+```
+
+`show` works on files with no extension, which is how clinical exports usually arrive. For the question the single-file dump can't answer — *what is in this tree* — a sweep of one tag per file is a few lines of the same library:
+
+```bash
+python - <<'EOF'
+from pathlib import Path
+import pydicom
+
+for f in sorted(Path("<source>").rglob("*")):
+    if not f.is_file():
+        continue
+    try:
+        ds = pydicom.dcmread(f, stop_before_pixels=True, force=True)
+    except Exception:
+        continue                       # not DICOM; skip
+    print(f, ds.get("Modality"), ds.get("Manufacturer"), ds.get("SeriesDescription"))
+EOF
+```
+
+Two arguments carry the weight. `stop_before_pixels=True` reads metadata only, so a multi-gigabyte cohort sweeps in seconds. `force=True` accepts files missing the 128-byte preamble and `DICM` marker — real clinical exports routinely lack them, and without the flag pydicom refuses files that every scanner and PACS in the building considers valid.
+
+This is also the eyeball tool for 7i's burned-in-text check: sweep for `Modality` of `OT`/`US`/`SC` (secondary capture), then `pydicom show` those files' `SeriesDescription` and `BurnedInAnnotation` before anything is pushed.
+
+If you'd rather have a system tool than a venv, `sudo apt install dcmtk` provides `dcmdump`, which does the single-file dump with no Python at all — but the venv version is the one that grows into a script when the question gets more specific.
+
+### 7k. A model-checkpoint registry — DVC plus a JSON manifest per model
+
+Checkpoints deserve the same discipline as cohorts, and they usually get less: a `runs/` directory of `best_final_v2_REAL.pth` files whose training data, metrics, and provenance live in someone's memory. The fix is a dedicated git + DVC repo where every model version is a directory holding two files — the DVC-tracked checkpoint and a git-tracked `manifest.json` that says what the checkpoint is:
+
+```
+models/
+  <model-name>/
+    <version>/
+      best.pth          # DVC-tracked — bytes live in S3
+      best.pth.dvc      # git-tracked pointer
+      manifest.json     # git-tracked — name, version, sha256, size,
+                        #   framework, architecture, training code @ commit,
+                        #   MLflow run, metrics, notes
+```
+
+The manifest goes in **git**, next to the pointer, not into DVC — that placement is the whole point. `git log models/<name>/` becomes the registry history; "which architecture, trained on what, what Dice, which MLflow run" is answerable without pulling a byte; and the recorded sha256 verifies a pulled artifact independently of DVC's own hashing.
+
+`scripts/model_dvc.sh` automates both halves. One-time setup — create and harden the bucket exactly as 7b does (public-access block, default encryption, versioning), make the repo, set the default remote:
+
+```bash
+scripts/model_dvc.sh init --bucket <bucket> --repo ~/repos/model-registry \
+  --region <region> --cache-dir /data/dvc-cache     # cache-dir per 7h, optional
+```
+
+Then per checkpoint:
+
+```bash
+scripts/model_dvc.sh checkin --repo ~/repos/model-registry \
+  --file runs/best.pth --name <model-name> --version v1 \
+  --framework "nnU-Net v2" --arch "3d_fullres" \
+  --train-repo "<org>/<training-repo>@<commit>" \
+  --mlflow-run "<run-id>" \
+  --metrics '{"dice_mean": 0.92}' \
+  --notes "what changed vs the previous version"
+```
+
+`checkin` copies the file to `models/<name>/<version>/`, computes sha256 + size, writes the manifest, runs `dvc add`, commits pointer + manifest together, and pushes. It **refuses to overwrite an existing checkpoint** — a new artifact is a new `--version`, which is what keeps `git log` meaning something (bucket versioning from 7b is the backstop, not the mechanism). Everything the script does is the 7h flow by hand; the script exists so the manifest never gets skipped "just this once".
+
+Retrieval on another machine is selective, like the cohort chunks in 7i — and the manifest lets you verify what arrived:
+
+```bash
+git clone <registry-git-remote> && cd model-registry
+dvc pull models/<model-name>/<version>            # just that model, not the registry
+cd models/<model-name>/<version>
+echo "$(python3 -c 'import json; print(json.load(open("manifest.json"))["sha256"])')  best.pth" | sha256sum -c
+```
+
+**Referencing a model from a consumer repo.** The repo that *uses* a model — an inference service, a container build — should not clone the registry or copy the checkpoint in. It should hold a reference that a tool can resolve, and `dvc import` is that reference: it writes a `.dvc` file into the consumer repo naming the registry's git URL, the path inside it, and the exact registry commit it resolved, then fetches the bytes from the *registry's* S3 remote — the consumer repo needs no remote of its own.
+
+```bash
+cd <consumer-repo>
+dvc init                          # once, if the repo doesn't already use DVC
+dvc import <registry-git-url> models/<model-name>/<version>/best.pth     -o weights/best.pth
+dvc import <registry-git-url> models/<model-name>/<version>/manifest.json -o weights/manifest.json
+git add .dvc/ weights/*.dvc weights/.gitignore
+git commit -m "weights: <model-name> <version> from the model registry"
+```
+
+The committed `.dvc` files pin the registry commit, so `dvc pull` on a fresh clone reproduces exactly these weights forever. Upgrading the model is re-running the import with the new `<version>` path — which makes the code review for a model swap a two-line diff: the path and the hash. (`dvc update weights/best.pth.dvc` re-resolves the same path against the registry's current HEAD; with per-version directories and a check-in script that refuses overwrites, that's deliberately a no-op.) Anyone — a colleague, CI — who runs `dvc pull` needs exactly two credentials: git read access to the registry repo and S3 read on its bucket.
+
+If initializing DVC inside a production repo is more change than the moment calls for, `dvc get` fetches the same artifact without leaving a pointer behind — appropriate inside a build script, where the version string in the script is itself the reference. Then the manifest check is not optional, because nothing else records what you expected to receive:
+
+```bash
+dvc get <registry-git-url> models/<model-name>/<version>/best.pth     -o weights/best.pth
+dvc get <registry-git-url> models/<model-name>/<version>/manifest.json -o weights/manifest.json
+cd weights && echo "$(python3 -c 'import json; print(json.load(open("manifest.json"))["sha256"])')  best.pth" | sha256sum -c
+```
+
+**A checkpoint is code, not data.** `.pth`/`.pkl` files are Python pickles; loading one executes whatever it contains. The registry is therefore a supply chain: write access to the bucket should be as narrow as the 7c IAM section makes it, the sha256 check above belongs after every pull on a machine that will *load* the file, and if the training stack can emit `safetensors` instead of pickles, prefer it.
+
+If you add a git remote for the registry repo, the manifests make it a readable catalog of your models — which is exactly why it should be a **private** remote.
+
 ---
 
 ## Data transfer — getting source data onto the box
@@ -856,11 +1026,13 @@ Use public or phantom data, never a patient case.
 ### 11a. Install
 
 ```bash
-uv pip install mlflow==3.14.0          # in the project venv — client + server
-uv tool install mlflow==3.14.0         # optional: standalone `mlflow server` CLI
+uv pip install mlflow==3.15.1          # in the project venv — client + server
+uv tool install mlflow==3.15.1         # optional: standalone `mlflow server` CLI
 ```
 
-MLflow 3.14 requires Python ≥3.10, the same floor as nnU-Net. If a machine only *logs* runs and never serves the UI, `mlflow-skinny` is a much smaller install with the same logging API.
+MLflow 3.x requires Python ≥3.10, the same floor as nnU-Net. If a machine only *logs* runs and never serves the UI, `mlflow-skinny` is a much smaller install with the same logging API.
+
+**One behaviour change to know before you pick a backend.** From **3.14** onward, a `file:` tracking URI — the classic `./mlruns` directory — raises on construction: the file store is in maintenance mode. Use a SQLite or Postgres backend (11c/11d below), or set `MLFLOW_ALLOW_FILE_STORE=true` to opt out deliberately. On 3.13 and earlier the file store still works unprompted, which is why an older runbook or a colleague's `mlruns` habit will steer you wrong here.
 
 ### 11b. Logging a run
 
@@ -989,7 +1161,10 @@ dvc --version && dvc remote list
 dvc cache dir                         # should be the data disk, not $HOME
 python -c "import torch, nnunetv2, totalsegmentator, mlflow; print('torch', torch.__version__, '| cuda', torch.cuda.is_available())"
 echo "$nnUNet_raw $nnUNet_preprocessed $nnUNet_results"
-curl -sf "$MLFLOW_TRACKING_URI/health" && echo " mlflow ok"
+case "$MLFLOW_TRACKING_URI" in                        # /health exists only on a server
+  http*) curl -sf "$MLFLOW_TRACKING_URI/health" && echo " mlflow server ok" ;;
+  *)     python -c "import mlflow; mlflow.search_experiments(); print('mlflow backend ok')" ;;
+esac
 tmux -V && tmux ls 2>/dev/null || echo "tmux installed, no sessions yet"
 lsblk -d -o NAME,SIZE,TRAN,MODEL -e7   # the drives you decided on in Step 9
 nvidia-smi
@@ -1019,7 +1194,7 @@ cd <repo>
 ```bash
 uv venv --python 3.11 && source .venv/bin/activate     # Step 4
 uv pip install -e .                                     # or -r requirements.txt
-uv pip install 'dvc[s3]' mlflow
+uv pip install 'dvc[s3]' mlflow==3.15.1
 ```
 
 ### Initialize DVC with the cache on the same disk
@@ -1303,7 +1478,14 @@ Two things worth understanding rather than pasting:
 fold 0: 8 train / 2 val | 4 vs 1 patients | leak=none
 ```
 
-nnU-Net reads `splits_final.json` from `$nnUNet_preprocessed/Dataset501_.../` and only **after** preprocessing has created that directory — so write it after the plan step below, or re-run the flag once preprocessing exists. A file written too early is silently overwritten by the random default.
+It writes that file into the **raw** dataset folder, beside `dataset.json`, because nnU-Net supports it there: `ExperimentPlanner.__init__` copies `$nnUNet_raw/Dataset501_.../splits_final.json` into `$nnUNet_preprocessed/Dataset501_.../` during `plan_and_preprocess`. So staging happens once, before preprocessing, and there is no ordering to remember.
+
+Two things nnU-Net does **not** do, worth knowing because the opposite is widely assumed:
+
+- **It never overwrites an existing split.** The trainer generates its random 5-fold only `if not isfile(splits_file)`; when the file is present it logs `Using splits from existing split file:` and uses it.
+- **A conflicting split fails loudly, not silently.** If a `splits_final.json` is already in the preprocessed folder from an earlier run, the planner does not replace it — it asserts that the folds match and crashes on mismatch. To adopt new splits, delete the preprocessed copy and re-plan.
+
+Confirm it took by grepping the training log for `Using splits from existing split file`; its absence means nnU-Net rolled its own.
 
 ### Preprocess
 
@@ -1319,15 +1501,38 @@ Neither `nnUNet_preprocessed` nor `nnUNet_results` belongs under DVC. Both are d
 
 ### MLflow on a headless box
 
-The MLflow section above sets up a shared server; for a single-user box a **file store is simpler and sufficient**, and it survives having no database to back up:
+The MLflow section above stands up a shared server. For a single-user box you do not need one — but you also do not need the old `./mlruns` file store. **Point the client straight at a SQLite file.** No server process, one file to back up, and it is the backend MLflow actually supports going forward:
 
 ```bash
-export MLFLOW_TRACKING_URI="file:/data/repos/<repo>/mlruns"
-export MLFLOW_ALLOW_FILE_STORE=true        # mlflow >= 3.15 gates the file store behind this
-export MLFLOW_EXPERIMENT=spine-seg
+export MLFLOW_TRACKING_URI="sqlite:////data/repos/<repo>/mlflow.db"
+export MLFLOW_EXPERIMENT_NAME=spine-seg
 ```
 
-`MLFLOW_ALLOW_FILE_STORE` is the one that wastes an afternoon: without it recent MLflow refuses the `file:` backend with an error that reads like a configuration mistake rather than an opt-out.
+Note the **four** slashes — three for the scheme plus the leading `/` of an absolute path. Three slashes is a path relative to the process's working directory, which is how a systemd-launched run writes its metrics to a different database than the one your UI is reading.
+
+`MLFLOW_EXPERIMENT_NAME` is MLflow's own variable, so `mlflow.start_run()` picks the experiment up without an explicit `set_experiment` call.
+
+**Set the artifact location explicitly, once, when you create the experiment.** With no server there is nothing holding a default artifact root, so MLflow falls back to `./mlruns` **relative to the training process's working directory** — while the metrics go to the absolute SQLite path. Under `systemd-run`, whose working directory is whatever you passed, that means `progress.png` and every logged plot land somewhere other than where you are looking, and the run still reports success:
+
+```python
+import mlflow
+mlflow.set_tracking_uri("sqlite:////data/repos/<repo>/mlflow.db")
+if mlflow.get_experiment_by_name("spine-seg") is None:
+    mlflow.create_experiment("spine-seg", artifact_location="/data/mlflow/artifacts")
+```
+
+Only the creating call takes `artifact_location` — an experiment that already exists keeps whatever root it was born with, and no amount of re-running this changes it. Check what you actually got before a long run:
+
+```bash
+python -c "import mlflow; mlflow.set_tracking_uri('sqlite:////data/repos/<repo>/mlflow.db'); \
+print(mlflow.get_experiment_by_name('spine-seg').artifact_location)"
+```
+
+An `mlruns` relative path in that output is the bug; make a new experiment with the right root rather than trying to repair the old one.
+
+**Why not the file store.** As of MLflow **3.14** a `file:` tracking URI raises on construction — the file store is in maintenance mode and the exception points at `mlflow migrate-filestore`. You can opt back in with `MLFLOW_ALLOW_FILE_STORE=true`, and that is the right move for an existing `mlruns/` tree you are not ready to migrate, but it is the wrong thing to start a new box on. SQLite is no harder and stays supported.
+
+**SQLite is single-writer**, which is fine for one fold at a time. Running folds concurrently produces `database is locked` and shows up as gaps in the curves rather than a crash — see the tracking-server section below before parallelising.
 
 nnU-Net has no MLflow integration; tracking comes from a trainer subclass that logs on `on_train_start` / `on_epoch_end` / `on_train_end`. The pattern that works well is to **gate it behind an environment variable and make every MLflow call non-fatal** — a tracking-server hiccup must never take down a run that is twelve hours in:
 
@@ -1341,7 +1546,6 @@ def on_train_start(self):
         return
     try:
         import mlflow
-        mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT", "default"))
         run = mlflow.start_run(run_name=os.environ.get("MLFLOW_RUN_NAME"))
         mlflow.log_params({"trainer": type(self).__name__, "fold": self.fold,
                            "num_epochs": self.num_epochs, "initial_lr": self.initial_lr,
@@ -1362,12 +1566,14 @@ Per epoch, log `train_loss`, `val_loss`, `mean_fg_dice`, `ema_fg_dice`, `lr`, an
 
 ### Reaching the UI from your laptop
 
-For a file store, the UI is a reader process pointed at the same directory:
+The UI is a reader process pointed at the same database:
 
 ```bash
-mlflow ui --backend-store-uri "file:/data/repos/<repo>/mlruns" \
+mlflow ui --backend-store-uri "sqlite:////data/repos/<repo>/mlflow.db" \
           --host 127.0.0.1 --port 5000
 ```
+
+Give it the same four-slash URI the training runs use. A UI that opens cleanly and shows no runs is nearly always reading a different, empty database.
 
 Keep `--host 127.0.0.1`. Default MLflow has **no authentication**, so `--host 0.0.0.0` on a box with a routable address publishes every run, and the delete button, to anyone who finds the port. Reach it by forwarding instead:
 
@@ -1392,8 +1598,8 @@ Three mechanisms, and they are not interchangeable.
 systemd-run --user --slice=compute.slice --unit=train-501-f0 \
   --working-directory="$PWD" \
   --setenv=nnUNet_raw --setenv=nnUNet_preprocessed --setenv=nnUNet_results \
-  --setenv=TRAIN_MLFLOW=1 --setenv=MLFLOW_ALLOW_FILE_STORE=true \
-  --setenv=MLFLOW_TRACKING_URI --setenv=MLFLOW_EXPERIMENT \
+  --setenv=TRAIN_MLFLOW=1 \
+  --setenv=MLFLOW_TRACKING_URI --setenv=MLFLOW_EXPERIMENT_NAME \
   --setenv=MLFLOW_RUN_NAME=d501-fold0-250ep \
   --setenv=nnUNet_n_proc_DA=6 \
   /data/repos/<repo>/.venv/bin/nnUNetv2_train 501 3d_fullres 0
@@ -1462,7 +1668,8 @@ A resumed run starts a **new MLflow run** unless you pass the previous run id ba
 - [ ] `track` re-run **after** labelling; `dvc status -c` clean before push
 - [ ] `qc_cohort.py` exits 0 across all cohorts being combined
 - [ ] labelmaps identical across cohorts; no shared patients; no duplicate scans
-- [ ] `splits_final.json` written **after** preprocessing, patient-disjoint
+- [ ] `splits_final.json` staged into `$nnUNet_raw/Dataset<ID>_<Name>/`, patient-disjoint
+- [ ] training log says `Using splits from existing split file` — not that it created one
 - [ ] `--channel-name CT` for CT, so normalisation is the global scheme
 - [ ] MLflow logs the `.dvc` pointer and the git SHA, not a directory path
 - [ ] MLflow bound to `127.0.0.1`, reached over an SSH tunnel
@@ -1474,7 +1681,7 @@ A resumed run starts a **new MLflow run** unless you pass the previous run id ba
 
 ## nnU-Net training with an MLflow tracking server
 
-The section above logs to a **file store**, which is the right default for one person on one box. This one runs an actual **tracking server** — the version you want when runs come from more than one repo, when you want the UI live while training, or when a model registry is in the future.
+The section above writes straight to a **local SQLite file**, which is the right default for one person on one box. This one runs an actual **tracking server** in front of that database — the version you want when runs come from more than one repo, when you want the UI live while training, or when a model registry is in the future.
 
 It is otherwise the same training. The differences that matter are the three places nnU-Net actively resists being instrumented, and all three are silent failures.
 
@@ -1483,7 +1690,7 @@ It is otherwise the same training. The differences that matter are the three pla
 ```bash
 uv venv --python 3.11 && source .venv/bin/activate
 uv pip install torch --index-url https://download.pytorch.org/whl/cu124   # match your driver
-uv pip install nnunetv2==2.8.1 mlflow
+uv pip install nnunetv2==2.8.1 mlflow==3.15.1
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
@@ -1600,7 +1807,7 @@ Then point clients at it, and view it over an SSH tunnel (`ssh -N -L 5000:127.0.
 export MLFLOW_TRACKING_URI=http://127.0.0.1:5000
 ```
 
-`MLFLOW_ALLOW_FILE_STORE` is **not** needed here. That variable gates `file:` URIs only; setting it against a server is harmless but signals a confusion worth not having.
+`MLFLOW_ALLOW_FILE_STORE` is **not** needed here, and neither is it needed for the SQLite setup above. It gates `file:`/`./mlruns` URIs only; setting it anywhere else is harmless but signals a confusion worth not having.
 
 **SQLite is single-writer.** Training one fold at a time is fine. Launch four folds concurrently and metric writes start colliding with `database is locked`, which surfaces as gaps in the curves rather than a crash. If you intend to run folds in parallel, move the backend to Postgres before you do, not after.
 
@@ -1628,7 +1835,6 @@ class _MLflowMixin:
             return
         try:
             import mlflow
-            mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT", "default"))
             run = mlflow.start_run(run_name=os.environ.get("MLFLOW_RUN_NAME"))
             self._mlf = mlflow
             mlflow.log_params({
@@ -1734,7 +1940,7 @@ systemd-run --user --slice=compute.slice --unit=train-501-f0 \
   --setenv=nnUNet_raw --setenv=nnUNet_preprocessed --setenv=nnUNet_results \
   --setenv=TRAIN_MLFLOW=1 \
   --setenv=MLFLOW_TRACKING_URI=http://127.0.0.1:5000 \
-  --setenv=MLFLOW_EXPERIMENT=spine-seg \
+  --setenv=MLFLOW_EXPERIMENT_NAME=spine-seg \
   --setenv=MLFLOW_RUN_NAME=d501-fold0-1000ep \
   --setenv=MLFLOW_RUN_ID_FILE=/tmp/train-501-f0.runid \
   --setenv=nnUNet_n_proc_DA=6 \
@@ -1842,7 +2048,7 @@ chmod +x /data/repos/<repo>/queue.sh
 systemd-run --user --slice=compute.slice --unit=train-501-all \
   --working-directory=/data/repos/<repo> \
   --setenv=nnUNet_raw --setenv=nnUNet_preprocessed --setenv=nnUNet_results \
-  --setenv=TRAIN_MLFLOW=1 --setenv=MLFLOW_TRACKING_URI --setenv=MLFLOW_EXPERIMENT \
+  --setenv=TRAIN_MLFLOW=1 --setenv=MLFLOW_TRACKING_URI --setenv=MLFLOW_EXPERIMENT_NAME \
   /data/repos/<repo>/queue.sh
 ```
 
@@ -1923,9 +2129,11 @@ The runbook says "back it up" about the MLflow database twice without saying how
 | MLflow DB + artifacts | **No** — not reconstructable from anything | **Yes**, this is the priority |
 | ID maps / crosswalks (outside the data root) | No | **Yes**, and note they are the sensitive ones |
 | `nnUNet_results` checkpoints | Only by re-training (GPU-days) | **Yes** — cheap to store, expensive to recreate |
-| Hand-written `splits_final.json`, plans edits | No, if hand-edited | Yes |
+| Hand-edited `splits_final.json`, plans edits | No, if hand-edited | Yes |
 | `nnUNet_preprocessed` | Yes, from raw + plans | No |
 | `nnUNet_raw` (symlinks into the DVC tree) | Yes, from the cohort | No |
+
+`splits_final.json` sits inside `nnUNet_raw` but is not covered by that last row. A file `stage_nnunet.py --write-splits` generated is regenerable — the assignment is deterministic given the same cohort. One you edited by hand is not, and it silently redefines every validation number in the experiment. Copy it out.
 | DVC cache | It is already on the DVC remote | No |
 
 The distinction that matters: **DVC push is not a backup.** It versions data you deliberately tracked, on a remote you chose. It says nothing about the MLflow database, the ID maps, or the checkpoints — which is exactly the set that has no other copy.

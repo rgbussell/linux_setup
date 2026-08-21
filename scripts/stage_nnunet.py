@@ -18,6 +18,12 @@ DVC-tracked tree stays the single source of truth.
 random over *cases*; when one patient contributed two studies, that patient
 lands in train and val at once and every reported metric is optimistic. This
 writes a patient-disjoint ``splits_final.json`` instead.
+
+The file goes in the **raw** dataset folder, next to ``dataset.json``. That is a
+supported nnU-Net hook: ``ExperimentPlanner.__init__`` copies
+``$nnUNet_raw/Dataset<ID>_<Name>/splits_final.json`` into the preprocessed
+folder during ``plan_and_preprocess``. Writing it here means staging happens in
+one step, before preprocessing, with no ordering to remember.
 """
 
 from __future__ import annotations
@@ -69,11 +75,6 @@ def main() -> int:
     )
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--write-splits", action="store_true", help="patient-disjoint splits_final.json")
-    ap.add_argument(
-        "--nnunet-preprocessed",
-        type=Path,
-        default=Path(os.environ["nnUNet_preprocessed"]) if os.environ.get("nnUNet_preprocessed") else None,
-    )
     args = ap.parse_args()
 
     if args.nnunet_raw is None:
@@ -153,8 +154,6 @@ def main() -> int:
         by_patient[case_patient[case]].append(case)
 
     if args.write_splits:
-        if args.nnunet_preprocessed is None:
-            return _fail("--write-splits needs $nnUNet_preprocessed or --nnunet-preprocessed")
         patients = sorted(by_patient)
         if len(patients) < args.folds:
             return _fail(f"{len(patients)} patients cannot fill {args.folds} folds")
@@ -166,12 +165,12 @@ def main() -> int:
             train = sorted(c for p in patients if p not in val_patients for c in by_patient[p])
             splits.append({"train": train, "val": val})
 
-        dest_dir = args.nnunet_preprocessed / f"Dataset{args.id:03d}_{args.name}"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / "splits_final.json"
+        dest = out / "splits_final.json"
         dest.write_text(json.dumps(splits, indent=2) + "\n")
         print(f"wrote {dest}  ({len(patients)} patients, patient-disjoint {args.folds}-fold)")
-        print("nnU-Net reads this only AFTER preprocessing -- re-run this flag if you re-plan.")
+        print("plan_and_preprocess copies this into $nnUNet_preprocessed. If a splits_final.json")
+        print("is already there from an earlier run, planning asserts rather than overwriting --")
+        print("delete the preprocessed copy to adopt these splits.")
     else:
         multi = sum(1 for studies in by_patient.values() if len(studies) > 1)
         if multi:
