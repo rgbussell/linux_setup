@@ -2132,9 +2132,9 @@ The runbook says "back it up" about the MLflow database twice without saying how
 | Hand-edited `splits_final.json`, plans edits | No, if hand-edited | Yes |
 | `nnUNet_preprocessed` | Yes, from raw + plans | No |
 | `nnUNet_raw` (symlinks into the DVC tree) | Yes, from the cohort | No |
-
-`splits_final.json` sits inside `nnUNet_raw` but is not covered by that last row. A file `stage_nnunet.py --write-splits` generated is regenerable — the assignment is deterministic given the same cohort. One you edited by hand is not, and it silently redefines every validation number in the experiment. Copy it out.
 | DVC cache | It is already on the DVC remote | No |
+
+`splits_final.json` sits inside `nnUNet_raw` but is not covered by that row. A file `stage_nnunet.py --write-splits` generated is regenerable — the assignment is deterministic given the same cohort. One you edited by hand is not, and it silently redefines every validation number in the experiment. Copy it out.
 
 The distinction that matters: **DVC push is not a backup.** It versions data you deliberately tracked, on a remote you chose. It says nothing about the MLflow database, the ID maps, or the checkpoints — which is exactly the set that has no other copy.
 
